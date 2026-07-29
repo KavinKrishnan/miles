@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from starlette.responses import Response
 
 from miles.rollout.generate_utils.sample_utils import merge_samples
+from miles.rollout.session.config import SessionServerConfig
 from miles.rollout.session.errors import (
     MessageValidationError,
     SessionNotFoundError,
@@ -231,10 +232,12 @@ def extract_completion(result: dict) -> tuple:
 class SessionCore:
     """HTTP session operations over one ``SessionRegistry``."""
 
-    def __init__(self, backend, registry: SessionRegistry, args, session_server_instance_id=None):
+    def __init__(
+        self, backend, registry: SessionRegistry, config: SessionServerConfig, session_server_instance_id=None
+    ):
         self.backend = backend
         self.registry = registry
-        self.args = args
+        self.config = config
         self.instance_id = session_server_instance_id
 
     async def health(self) -> Response:
@@ -283,7 +286,7 @@ class SessionCore:
             return _samples_response(encode_samples([], metadata, empty_reason="no_records"))
         try:
             samples = compute_samples_from_openai_records(
-                self.args,
+                self.config,
                 session.records,
                 tokenizer,
                 accumulated_token_ids=metadata.get("accumulated_token_ids"),
@@ -332,7 +335,7 @@ class SessionCore:
                 raise SessionNotFoundError(f"session not found: session_id={session_id}")
 
             request_body, client_stream, tito_tokenizer = prepare_chat_request(
-                body, self.args, self.registry.tito_tokenizer
+                body, self.config, self.registry.tito_tokenizer
             )
 
             request_messages = request_body.get("messages", [])
