@@ -38,7 +38,7 @@ WORKDIR /root/
 
 RUN apt update
 # ethtool for network diagnostics
-RUN apt install -y nvtop rsync dnsutils ethtool
+RUN apt install -y nvtop rsync dnsutils ethtool tmux
 
 # nccl-tests for diagnostics
 RUN git clone https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests && \
@@ -224,6 +224,9 @@ RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
     else \
       echo "CUDA 12 variant: keeping the base image's mooncake"; \
     fi
+
+COPY docker/install-kube-tools.sh /tmp/install-kube-tools.sh
+RUN bash /tmp/install-kube-tools.sh "${TARGETARCH}" && rm -f /tmp/install-kube-tools.sh
 
 # ====================================== Install main package ============================================
 
