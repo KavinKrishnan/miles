@@ -756,14 +756,41 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--update-weight-transfer-mode",
-                choices=["broadcast", "p2p", "disk-delta"],
+                choices=["broadcast", "p2p", "disk-delta", "modelexpress"],
                 default="broadcast",
                 help=(
                     "The method to transfer weights to remote rollout engines during update weight. "
                     "'disk-delta' diffs each sync against a CPU snapshot of the previous one and publishes "
                     "only the changed bytes to --update-weight-disk-dir; each engine's /pull_weights applies "
-                    "them into a host-local checkpoint that the engine reloads from."
+                    "them into a host-local checkpoint that the engine reloads from. 'modelexpress' performs "
+                    "a remote full-model BF16 refit through per-worker ModelExpress/NIXL clients."
                 ),
+            )
+            parser.add_argument(
+                "--modelexpress-publisher-adapter",
+                type=str,
+                default=None,
+                help=(
+                    "Optional import path to a zero-argument trainer-side ModelExpress publisher factory. "
+                    "The returned object must implement configure() and publish_and_execute()."
+                ),
+            )
+            parser.add_argument(
+                "--modelexpress-model-name",
+                type=str,
+                default=None,
+                help=(
+                    "Exact ModelExpress rendezvous model name shared by trainer and SGLang "
+                    "(normally the SGLang model path/repository id). Required for modelexpress "
+                    "weight transfer; this is distinct from --model-name, which selects Miles' "
+                    "Megatron-to-HF converter."
+                ),
+            )
+            parser.add_argument(
+                "--modelexpress-update-timeout",
+                type=float,
+                default=600.0,
+                help="Timeout in seconds for the SGLang ModelExpress receiver endpoint.",
             )
             parser.add_argument(
                 "--update-weight-disk-dir",
@@ -3035,6 +3062,20 @@ def miles_validate_args(args):
         assert os.path.isdir(args.hf_checkpoint), (
             "--update-weight-transfer-mode=disk-delta requires --hf-checkpoint to be a local directory: "
             "the baseline snapshot is seeded from its safetensors bytes."
+        )
+
+    if args.update_weight_transfer_mode == "modelexpress":
+        assert not args.colocate, "ModelExpress weight transfer requires remote/disaggregated rollout engines."
+        assert args.lora_rank <= 0 and args.multi_lora_n_adapters == 0, (
+            "ModelExpress weight transfer supports full-model refit only; LoRA and multi-LoRA are unsupported."
+        )
+        assert args.bf16 and not args.fp16, "ModelExpress weight transfer currently supports BF16 weights only."
+        assert not args.update_weight_disk_dir and not args.update_weight_local_checkpoint_dir, (
+            "ModelExpress weight transfer has no disk fallback; remove the disk weight-transfer directories."
+        )
+        assert args.modelexpress_update_timeout > 0, "--modelexpress-update-timeout must be positive."
+        assert args.modelexpress_model_name and args.modelexpress_model_name.strip(), (
+            "--modelexpress-model-name must exactly match the model name used by SGLang."
         )
 
     if args.colocate:

@@ -268,7 +268,7 @@ class SGLangEngine(RayActor):
                 )
             response.raise_for_status()
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
@@ -282,7 +282,10 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        request_kwargs = {"json": payload or {}}
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        response = requests.post(url, **request_kwargs)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -290,6 +293,44 @@ class SGLangEngine(RayActor):
                 e.add_note(f"{response.text=}")
             raise
         return response.json()
+
+    def update_weights_from_modelexpress(self, *, payload: dict, timeout: float = 600.0):
+        """Run the upstream ModelExpress SGLang worker refit endpoint.
+
+        This wrapper deliberately has no alternate transport: an SGLang build
+        without the endpoint is incompatible and fails the refit.
+        """
+        allowed = {"target_training_step", "logical_group", "expected_layout_signature"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported ModelExpress SGLang request fields: {sorted(unknown)}")
+        if "target_training_step" not in payload:
+            raise ValueError("ModelExpress update payload is missing target_training_step")
+        target_training_step = payload["target_training_step"]
+        if (
+            isinstance(target_training_step, bool)
+            or not isinstance(target_training_step, int)
+            or target_training_step < 0
+        ):
+            raise ValueError("target_training_step must be a non-negative integer")
+        if payload.get("logical_group", "model") != "model":
+            raise ValueError("ModelExpress SGLang live refit supports only logical_group='model'")
+        expected_signature = payload.get("expected_layout_signature")
+        if expected_signature is not None and not isinstance(expected_signature, str):
+            raise ValueError("expected_layout_signature must be a string")
+        if timeout <= 0:
+            raise ValueError("ModelExpress update timeout must be positive")
+        try:
+            return self._make_request("update_weights_from_modelexpress", payload, timeout=timeout)
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in (404, 405):
+                raise RuntimeError(
+                    "This SGLang runtime does not provide the required "
+                    "/update_weights_from_modelexpress endpoint. Install the proposed/upstream "
+                    "ModelExpress integration; Miles will not fall back to NCCL, Mooncake, or disk."
+                ) from exc
+            raise
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.

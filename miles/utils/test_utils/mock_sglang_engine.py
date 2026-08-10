@@ -111,6 +111,21 @@ class MockSGLangEngine:
         self._record("simulate_crash", (), {})
         self.shutdown()
 
+    def update_weights_from_modelexpress(self, *, payload: dict, timeout: float = 600.0):
+        self._record("update_weights_from_modelexpress", (), {"payload": payload, "timeout": timeout})
+        self._maybe_fault("update_weights_from_modelexpress")
+        target = payload["target_training_step"]
+        return {
+            "success": True,
+            "target_training_step": target,
+            "installed_training_step": target,
+            "layout_signature": "mock-layout",
+            "metrics": {},
+            "timing": {},
+            "error": None,
+            "receiver_poisoned": False,
+        }
+
     def _get_current_node_ip_and_free_port(self, start_port: int = 15000, consecutive: int = 1):
         self._record("_get_current_node_ip_and_free_port", (), {"start_port": start_port, "consecutive": consecutive})
         with self._lock:
