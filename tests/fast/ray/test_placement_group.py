@@ -19,6 +19,7 @@ def _make_args(**overrides) -> Namespace:
         sglang_router_ip=None,
         sglang_router_port=None,
         cluster_backend="ray",
+        eval_num_gpus=0,
         debug_train_only=False,
         use_session_server=False,
     )
@@ -30,8 +31,9 @@ def _make_args(**overrides) -> Namespace:
 def fake_components():
     controller_handle = MagicMock(name="inference_controller")
     controller_handle.init = AsyncMock(return_value=None)
+    controller_handle.eval_fleet = None
 
-    async def resolve_router_addrs(args, *, provider) -> dict:
+    async def resolve_router_addrs(args, *, router_providers) -> dict:
         args.sglang_router_ip = "10.0.0.1"
         args.sglang_router_port = 4321
         return {}
@@ -44,7 +46,7 @@ def fake_components():
         events.append("session_servers_ready")
 
     executor_handle = MagicMock(name="rollout_executor")
-    executor_handle.set_eval_fleet.remote = AsyncMock()
+    executor_handle.set_eval_fleet = AsyncMock()
     executor_handle.init = AsyncMock(side_effect=lambda: events.append("executor_init"))
     executor_handle.get_num_rollout_per_epoch = AsyncMock(return_value=5)
 
