@@ -11,7 +11,7 @@ from scripts.run_glm5_2_744b_a40b import (
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from tests.ci.metric_history import register_ci_gate
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 # Smoke test for the GLM-5.2 (glm_moe_dsa) training script. Exercises the DSA
 # cross-layer index-sharing path (5 layers = 3 dense + 2 MoE, computing layers
@@ -34,7 +34,8 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
-    return ScriptArgs(
+    return command_utils.default_config(
+        ScriptArgs,
         model_name="GLM-5.2_5layer",
         num_nodes=1,
         num_gpus_per_node=4,
@@ -45,6 +46,7 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
     _validate_glm_checkpoint(args)

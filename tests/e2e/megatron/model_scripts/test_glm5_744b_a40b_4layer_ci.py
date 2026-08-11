@@ -11,7 +11,7 @@ from scripts.run_glm5_744b_a40b import (
 from tests.ci.ci_register import register_cuda_ci
 from tests.ci.metric_history import register_ci_gate
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 # This CI test is an example smoke test for the DSA model code path used by DeepSeek V3.2 and GLM-5. It only verifies that the training script is functional, not model accuracy.
 
@@ -26,7 +26,8 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
-    return ScriptArgs(
+    return command_utils.default_config(
+        ScriptArgs,
         model_name="GLM-5_4layer",
         num_nodes=1,
         num_gpus_per_node=2,
@@ -37,6 +38,7 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
     _validate_glm_checkpoint(args)

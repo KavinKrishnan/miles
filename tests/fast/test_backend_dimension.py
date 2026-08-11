@@ -75,10 +75,21 @@ def _e2e_modules() -> list[Path]:
 
 def _constructs_a_launcher_config(path: Path) -> bool:
     tree = ast.parse(path.read_text(), filename=str(path))
-    return any(
-        isinstance(node, ast.Call) and _called_name(node.func) == command_utils.ExecuteTrainConfig.__name__
-        for node in ast.walk(tree)
-    )
+    pinning = _launcher_config_names() | {command_utils.ExecuteTrainConfig.__name__}
+    return any(isinstance(node, ast.Call) and _called_name(node.func) in pinning for node in ast.walk(tree))
+
+
+def _launcher_config_names() -> set[str]:
+    """Every subclass a launch script declares: calling one pins a backend exactly as the base class does."""
+    names: set[str] = set()
+    for script in sorted((REPO_ROOT / "scripts").rglob("*.py")):
+        tree = ast.parse(script.read_text(), filename=str(script))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and any(
+                _called_name(base) == command_utils.ExecuteTrainConfig.__name__ for base in node.bases
+            ):
+                names.add(node.name)
+    return names
 
 
 def _called_name(func: ast.expr) -> str:
@@ -135,3 +146,15 @@ class TestATrainingE2eTestRunsOnWhicheverBackendItsEnvironmentNames:
     def test_no_e2e_module_pins_a_backend_of_its_own(self, path: Path):
         """A config built in the test would outrank the environment and pin that test to one cluster forever."""
         assert not _constructs_a_launcher_config(path)
+
+    def test_the_guard_sees_through_a_launch_script_subclass(self):
+        """Matching the base class name alone let every ScriptArgs(...) of a model script slip past."""
+        assert "ScriptArgs" in _launcher_config_names()
+
+    def test_overrides_reach_the_config_the_environment_built(self, monkeypatch):
+        """A script names only what its scenario needs; everything else has to stay the environment's call."""
+        monkeypatch.setenv("MILES_SCRIPT_CLUSTER_BACKEND", ClusterBackend.KUBERNETES.value)
+
+        config = command_utils.default_config(num_nodes=7)
+
+        assert (config.num_nodes, config.cluster_backend) == (7, ClusterBackend.KUBERNETES)

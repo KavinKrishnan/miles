@@ -4,6 +4,8 @@ from scripts.run_nemotron_3_ultra_550b_a55b import ScriptArgs, _execute_train, _
 from tests.ci.ci_register import register_cuda_ci
 from tests.ci.metric_history import register_ci_gate
 
+from miles.utils.external_utils import command_utils
+
 # Smoke test for the Nemotron-3-Ultra (nemotron_h: hybrid Mamba2 + Attention + latent-MoE)
 # training script. It runs a 4-layer slice on a single 8-GPU H200 node and only verifies that
 # the training script is functional, not model accuracy.
@@ -29,7 +31,8 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
-    return ScriptArgs(
+    return command_utils.default_config(
+        ScriptArgs,
         model_org="CharyZeng",
         model_name="NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16-4layer",
         mode="debug_minimal",

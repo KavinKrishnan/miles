@@ -2,13 +2,13 @@ import os
 
 from tests.ci.ci_register import register_cuda_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 register_cuda_ci(
     est_time=600, suite="stage-c-4-gpu-h200", labels=["megatron"], disabled="Not worthy for testing, too naive."
 )
 
-ENABLE_EVAL = U.get_bool_env_var("MILES_TEST_ENABLE_EVAL", "0")
+ENABLE_EVAL = command_utils.get_bool_env_var("MILES_TEST_ENABLE_EVAL", "0")
 
 MODEL_NAME = "GLM-Z1-9B-0414"
 MODEL_TYPE = "glm4-9B"
@@ -16,6 +16,7 @@ NUM_GPUS = 4
 
 
 def prepare():
+    U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu("hf download zai-org/GLM-Z1-9B-0414 --local-dir /root/models/GLM-Z1-9B-0414")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
@@ -25,6 +26,7 @@ def prepare():
 
 
 def execute():
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
@@ -109,7 +111,7 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
