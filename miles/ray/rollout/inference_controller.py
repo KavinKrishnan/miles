@@ -228,6 +228,12 @@ class InferenceController:
             if isinstance(result, BaseException):
                 logger.error(f"Ticking cell {cell.meta.cell_id} failed", exc_info=result)
 
+        for srv in list(self.servers.values()):
+            for cell_id, cell in list(srv.server_cells.items()):
+                if cell.is_disposed:
+                    logger.warning(f"Dropping disposed cell {cell_id} so it can be observed and rebuilt")
+                    del srv.server_cells[cell_id]
+
     # -------------------------- reconcile -----------------------------
 
     @with_lock

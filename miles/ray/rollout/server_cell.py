@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -35,6 +36,7 @@ from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_TIMEOUT = 30
+INITIALIZING_TIMEOUT_SECONDS = 1800.0
 
 
 class ServerCellMetadata(FrozenStrictBaseModel):
@@ -58,6 +60,7 @@ class ServerCell:
     global_health_checker_activeness: Callable[[], ActiveAndEpoch] = lambda: ActiveAndEpoch(active=True, epoch=0)
     _health_checker: BaseHealthChecker = dataclasses.field(init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
+    _initializing_deadline: float = dataclasses.field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self._health_checker = create_rollout_cell_health_checker(
@@ -126,6 +129,10 @@ class ServerCell:
         return isinstance(self._state, StateServing)
 
     @property
+    def is_disposed(self) -> bool:
+        return isinstance(self._state, StateDisposed)
+
+    @property
     def addr_info(self) -> CellAddrInfo:
         assert isinstance(self._state, (StateInitializing, StatePendingWeights, StateServing))
         return self._state.addr_info
@@ -146,11 +153,26 @@ class ServerCell:
 
         addr_info = await self._compute_addr_info()
         await activate_launch_gate(gate_url=addr_info.gate_url)
+        self._initializing_deadline = time.monotonic() + INITIALIZING_TIMEOUT_SECONDS
         self._change_state("init", StateUninitialized, StateInitializing(addr_info=addr_info))
 
     async def tick(self) -> None:
-        if isinstance(self._state, StateInitializing):
+        if not isinstance(self._state, StateInitializing):
+            return
+
+        try:
             await self._tick_when_initializing()
+        except Exception:
+            logger.error(f"Cell {self.meta.cell_id} failed while initializing; disposing it for healing", exc_info=True)
+            await self.dispose()
+            return
+
+        if isinstance(self._state, StateInitializing) and time.monotonic() >= self._initializing_deadline:
+            logger.error(
+                f"Cell {self.meta.cell_id} did not finish initializing within "
+                f"{INITIALIZING_TIMEOUT_SECONDS}s; disposing it for healing"
+            )
+            await self.dispose()
 
     async def _tick_when_initializing(self) -> None:
         addr_info = self._state.addr_info
