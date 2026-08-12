@@ -4,6 +4,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from miles.ray.deployment import run_deployment
 from miles.ray.multi_lora.controller import get_multi_lora_controller
 from miles.ray.placement_group import create_rollout_components, create_training_models, update_weights
 from miles.ray.wiring import launch_worker_manager
@@ -65,7 +66,12 @@ async def main(args):
         # and only then does the data source sample them. The actor pushes only
         # stale adapter weights (newly loaded, or stepped by the last batch).
         await actor_model.reconcile_adapters()
-        await update_weights(actor_model, rollout_executor)
+        await update_weights(
+            args,
+            actor_model=actor_model,
+            rollout_executor=rollout_executor,
+            inference_controller=inference_controller,
+        )
 
         # With nothing active, generate would wait forever.
         post_update = await get_multi_lora_controller().snapshot()
@@ -94,4 +100,4 @@ async def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(args))
+    run_deployment(args, run_orchestration_script=main)

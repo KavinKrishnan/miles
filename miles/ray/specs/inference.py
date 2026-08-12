@@ -6,6 +6,7 @@ import sys
 from miles.backends.sglang_utils.router_args_utils import compute_sglang_router_args, router_args_to_argv
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, resolve_sglang_config
 from miles.backends.sglang_utils.sglang_engine import compute_engine_launch_cmd
+from miles.ray.specs.static_addrs import inference_controller_urls, static_router_addrs
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.rollout.session.config import compute_session_server_config
 from miles.router.config import compute_miles_router_config
@@ -15,8 +16,10 @@ from miles.utils.workers.argv_utils import config_to_argv
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.launch_gate import GATE_PORT_NAME
 from miles.utils.workers.naming import compute_worker_name
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.simple import SimpleWorkerProvider
 from miles.utils.workers.worker_spec import (
     CommandWorkerSpec,
     LaunchCommandContext,
@@ -37,6 +40,7 @@ INFERENCE_CONTROLLER_WORKER_CLASS = "miles.ray.rollout.inference_controller.Infe
 def spec_inference_controller(args) -> ServeWorkerSpec:
     return ServeWorkerSpec(
         name=INFERENCE_CONTROLLER_POOL_ID,
+        deploy_component=DeployComponent.INFERENCE,
         port_infos=[],
         env_var=lambda _ctx: {},
         scheduling=SchedulingSpec(
@@ -64,6 +68,9 @@ def backend_inference_engine_provider(args, *, capability: BackendCapability) ->
 
 
 def compute_router_providers(args, *, capability: BackendCapability) -> list[BaseWorkerProvider]:
+    if static_router_addrs(args) is not None:
+        return []
+
     config = resolve_sglang_config(args)
     return [
         capability.static_worker_provider(pool_id=compute_router_pool_id(model_idx))
@@ -71,13 +78,16 @@ def compute_router_providers(args, *, capability: BackendCapability) -> list[Bas
     ]
 
 
-def create_inference_controller_handle(*, capability: BackendCapability) -> BaseWorkerHandle:
-    worker_name = inference_controller_worker_name()
-    provider = capability.static_worker_provider(pool_id=INFERENCE_CONTROLLER_POOL_ID)
-    return provider.get_handle(worker_name)
+def create_inference_controller_handle(args, *, capability: BackendCapability) -> BaseWorkerHandle:
+    provider = compute_inference_controller_provider(args, capability=capability)
+    return provider.get_handle(inference_controller_worker_name())
 
 
 def compute_inference_controller_provider(args, *, capability: BackendCapability) -> BaseWorkerProvider:
+    if (urls := inference_controller_urls(args)) is not None:
+        return SimpleWorkerProvider.of_rpc_urls(
+            pool_id=INFERENCE_CONTROLLER_POOL_ID, urls=urls, worker_class=INFERENCE_CONTROLLER_WORKER_CLASS
+        )
     return capability.static_worker_provider(pool_id=INFERENCE_CONTROLLER_POOL_ID)
 
 
@@ -130,6 +140,7 @@ def _compute_spec_router(args, model_idx: int, model_cfg: ModelConfig) -> Comman
 
     return CommandWorkerSpec(
         name=compute_router_pool_id(model_idx),
+        deploy_component=DeployComponent.INFERENCE,
         port_infos=[
             _compute_router_primary_port_info(args, model_idx=model_idx),
             PortInfo(name="prometheus", static_port=9000, allow_dynamic=True),
@@ -154,14 +165,13 @@ def spec_session_server(args) -> CommandWorkerSpec:
     _config = resolve_sglang_config(args)  # TODO avoid resolve repeatedly
 
     def _compute_launch_command(ctx: LaunchCommandContext) -> str:
-        (router_addrs,) = ctx.spec_addrs[compute_router_pool_id(0)]
         config = compute_session_server_config(
             args,
             host=args.session_server_ip or ctx.self_addrs["primary"].host,
             port=ctx.self_addrs["primary"].port,
             # TODO: make the indexing it k8s native compatible
             instance_id=compute_session_server_instance_id(args, ctx.cell_index),
-            backend_url=router_addrs["primary"].addr,
+            backend_url=_compute_session_server_backend_url(args, ctx),
         )
         launch_argv = [sys.executable, "-m", "miles.rollout.session.server", *config_to_argv(config)]
         return shlex.join(launch_argv)
@@ -180,6 +190,13 @@ def spec_session_server(args) -> CommandWorkerSpec:
         ),
         launch_command=_compute_launch_command,
     )
+
+
+def _compute_session_server_backend_url(args, ctx: LaunchCommandContext) -> str:
+    if (router_addrs := static_router_addrs(args)) is not None:
+        return next(iter(router_addrs.values())).addr
+    (addrs,) = ctx.spec_addrs[compute_router_pool_id(0)]
+    return addrs["primary"].addr
 
 
 def _compute_session_server_primary_port_info(args) -> PortInfo:
@@ -268,6 +285,7 @@ def _compute_spec_inference_engine(
     return CommandWorkerSpec(
         name=compute_engine_pool_id(model_idx=model_idx, group_index=group_index),
         category=POOL_CATEGORY_INFERENCE_ENGINE,
+        deploy_component=DeployComponent.INFERENCE,
         port_infos=[
             PortInfo(name="primary", static_port=8000, allow_dynamic=True),
             PortInfo(

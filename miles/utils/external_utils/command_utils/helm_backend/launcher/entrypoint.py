@@ -32,13 +32,14 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc 
     InfraInfo,
     LaunchPlan,
     MooncakeInfo,
+    MooncakePlan,
 )
 from miles.utils.external_utils.command_utils.helm_backend.naming import RunFiles, RunNames
 from miles.utils.external_utils.command_utils.helm_backend.orchestrator.observer import wait_for_run
 from miles.utils.external_utils.model_args_utils import shell_safe_model_args
 from miles.utils.run_uuid import derive_run_uuid
 from miles.utils.workers.serving.utils import override_argv
-from miles.utils.workers.types import ClusterBackend
+from miles.utils.workers.types import ClusterBackend, DeployComponent
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,22 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
     ), f"run_id {run_id!r} names every object this run installs, so it has to match {_RUN_ID_PATTERN.pattern}"
 
     namespace = config.namespace
-    release = RunNames.release(run_id=run_id)
-    pod_argv, args = _compute_train_argv(request, run_id=run_id, release=release, namespace=namespace)
+    args = _parse_train_args(request, run_id=run_id)
+    deploy_component = DeployComponent(args.deploy_component)
+    assert deploy_component is config.deploy_component, (
+        f"the run's pods are told {deploy_component.value} while everything this launch installs is named after "
+        f"{config.deploy_component.value}"
+    )
+    deploys_orchestration_script = deploy_component.deploys_orchestration_script()
+    release = RunNames.release(run_id=run_id, deploy_component=deploy_component)
+    mooncake_plan = MooncakeInfo.plan_of_args(args)
+    pod_argv = _compute_pod_argv(
+        request,
+        run_id=run_id,
+        release=release,
+        namespace=namespace,
+        mooncake_plan=mooncake_plan if deploys_orchestration_script else None,
+    )
 
     specs = compute_specs(args)
     chart = chart_dir(repo_base_dir=repo_base_dir)
@@ -63,24 +78,26 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
     run_directory = RunFiles.run_dir(shared_root=shared_root, run_id=run_id)
 
     if config.ci_run:
-        _uninstall_leftover_ci_releases(namespace)
+        _uninstall_leftover_ci_releases(namespace, keep_run_id=run_id)
     Helm.build_dependencies(chart)
 
     installed_manifest = Helm.get_manifest(release, namespace)
-    state_file = _compute_state_file(
-        installed_manifest=installed_manifest, run_directory=run_directory, release=release
+    state_file = (
+        _compute_state_file(installed_manifest=installed_manifest, run_directory=run_directory, release=release)
+        if deploys_orchestration_script
+        else None
     )
 
     plan = LaunchPlan(
         run_id=run_id,
         release=release,
         namespace=namespace,
-        state_file=str(state_file),
-        orchestrator_command=["python", request.train_script, *pod_argv],
+        state_file=str(state_file) if state_file is not None else "",
+        orchestrator_command=["python", request.train_script, *pod_argv] if deploys_orchestration_script else [],
         worker_argv=pod_argv,
         env=train_env_vars(request, {}, config=config),
         colocate=bool(args.colocate),
-        mooncake_plan=MooncakeInfo.plan_of_args(args),
+        mooncake_plan=mooncake_plan if deploys_orchestration_script else None,
         prepare_cmd=request.prepare_cmd,
     )
     values_path = RunFiles.new_values_file(run_directory=run_directory)
@@ -117,6 +134,13 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
         ci_run=config.ci_run,
     )
 
+    if state_file is None:
+        logger.info(
+            f"Installed {release}, which carries no orchestration script: it has no training to finish, so it stays "
+            f"up until you uninstall it with `helm uninstall {release} --namespace {namespace}`"
+        )
+        return
+
     _follow_until_finished(release=release, namespace=namespace, state_file=state_file)
 
 
@@ -138,9 +162,27 @@ def _follow_until_finished(*, release: str, namespace: str, state_file: Path) ->
         raise SystemExit(outcome.exit_code)
 
 
-def _compute_train_argv(
-    request: ExecuteTrainRequest, *, run_id: str, release: str, namespace: str
-) -> tuple[list[str], Any]:
+def _parse_train_args(request: ExecuteTrainRequest, *, run_id: str) -> Any:
+    with override_argv(_compute_base_argv(request, run_id=run_id)):
+        return parse_args()
+
+
+def _compute_pod_argv(
+    request: ExecuteTrainRequest,
+    *,
+    run_id: str,
+    release: str,
+    namespace: str,
+    mooncake_plan: MooncakePlan | None,
+) -> list[str]:
+    return MooncakeInfo.with_cluster_master(
+        _compute_base_argv(request, run_id=run_id),
+        plan=mooncake_plan,
+        host=MooncakeInfo.master_service_host(release, namespace),
+    )
+
+
+def _compute_base_argv(request: ExecuteTrainRequest, *, run_id: str) -> list[str]:
     argv = [*shlex.split(shell_safe_model_args(request.megatron_model_type)), *shlex.split(request.train_args)]
     assert not ArgvManipulator.declares(argv, _ENV_REPORT_FLAG), (
         f"{_ENV_REPORT_FLAG} is what this launcher tells the pods about the launch that installed them, and an "
@@ -148,15 +190,7 @@ def _compute_train_argv(
     )
     argv = ArgvManipulator.with_flag(argv, CLUSTER_BACKEND_FLAG, ClusterBackend.KUBERNETES.value)
     # TODO: generate different run_uuid even for same run_id, but at the same time allow helm upgrading
-    argv = ArgvManipulator.with_flag(argv, _RUN_UUID_FLAG, derive_run_uuid(run_id))
-
-    with override_argv(argv):
-        args = parse_args()
-
-    pod_argv = MooncakeInfo.with_cluster_master(
-        argv, plan=MooncakeInfo.plan_of_args(args), host=MooncakeInfo.master_service_host(release, namespace)
-    )
-    return pod_argv, args
+    return ArgvManipulator.with_flag(argv, _RUN_UUID_FLAG, derive_run_uuid(run_id))
 
 
 def _compute_pod_record_file(*, installed_manifest: Manifest | None, record_path: Path) -> str | None:
@@ -205,8 +239,14 @@ def _assert_upgrade_only_resizes(
     logger.warning(f"forced: {message}")
 
 
-def _uninstall_leftover_ci_releases(namespace: str) -> list[str]:
-    releases = Helm.list_releases(namespace=namespace, selector=f"{CI_LABEL}=true")
+def _belongs_to_run(release: str, *, run_id: str) -> bool:
+    own = RunNames.release(run_id=run_id)
+    return release == own or release.startswith(f"{own}-")
+
+
+def _uninstall_leftover_ci_releases(namespace: str, *, keep_run_id: str) -> list[str]:
+    listed = Helm.list_releases(namespace=namespace, selector=f"{CI_LABEL}=true")
+    releases = [release for release in listed if not _belongs_to_run(release, run_id=keep_run_id)]
     for release in releases:
         logger.info(f"Uninstalling the leftover ci release {release} before this run installs its own")
         Helm.uninstall(release=release, namespace=namespace)

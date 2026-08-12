@@ -20,7 +20,9 @@ def _infra_file(tmp_path: Path, name: str, values: dict[str, Any]) -> str:
 
 def _stub_launch_inputs(monkeypatch, *, specs, colocate: bool = False) -> None:
     monkeypatch.setattr(entrypoint, "compute_specs", lambda args: specs)
-    monkeypatch.setattr(entrypoint, "parse_args", lambda: SimpleNamespace(colocate=colocate, argv=[]))
+    monkeypatch.setattr(
+        entrypoint, "parse_args", lambda: SimpleNamespace(colocate=colocate, deploy_component="all", argv=[])
+    )
     monkeypatch.setattr(MooncakeInfo, "plan_of_args", staticmethod(lambda args: None))
     monkeypatch.setattr(entrypoint, "_follow_until_finished", lambda **kwargs: None)
 

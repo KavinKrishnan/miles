@@ -10,6 +10,7 @@ from tests.fast.ray.test_wiring import stub_kubernetes_capability
 from miles.ray import wiring
 from miles.utils.external_utils.command_utils.base_backend import (
     CLUSTER_BACKEND_FLAG,
+    DEPLOY_COMPONENT_FLAG,
     ExecuteTrainConfig,
     ExecuteTrainRequest,
 )
@@ -20,7 +21,7 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrap
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import LaunchPlan, MooncakeInfo
 from miles.utils.run_uuid import derive_run_uuid
-from miles.utils.workers.types import ClusterBackend
+from miles.utils.workers.types import ClusterBackend, DeployComponent
 from miles.utils.workers.worker_spec import CommandWorkerSpec, PortInfo, SchedulingSpec
 
 
@@ -28,12 +29,21 @@ def declared_cluster_backends(argv: list[str]) -> list[str]:
     return ArgvManipulator.values_of(argv, CLUSTER_BACKEND_FLAG)
 
 
+def declared_deploy_components(argv: list[str]) -> list[str]:
+    return ArgvManipulator.values_of(argv, DEPLOY_COMPONENT_FLAG)
+
+
 NAMESPACE = "rl"
 RUN_ID = "260101-000000-000"
 
 
-def _config(run_id: str = RUN_ID) -> ExecuteTrainConfig:
-    return ExecuteTrainConfig(cluster_backend=ClusterBackend.KUBERNETES, namespace=NAMESPACE, run_id=run_id)
+def _config(run_id: str = RUN_ID, deploy_component: DeployComponent = DeployComponent.ALL) -> ExecuteTrainConfig:
+    return ExecuteTrainConfig(
+        cluster_backend=ClusterBackend.KUBERNETES,
+        namespace=NAMESPACE,
+        run_id=run_id,
+        deploy_component=deploy_component,
+    )
 
 
 def _request(train_args: str) -> ExecuteTrainRequest:
@@ -60,24 +70,43 @@ def _router() -> CommandWorkerSpec:
     )
 
 
-def launch_argv(monkeypatch: pytest.MonkeyPatch, *, train_args: str, run_id: str = RUN_ID) -> list[str]:
+def launch_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    train_args: str,
+    run_id: str = RUN_ID,
+    deploy_component: DeployComponent = DeployComponent.ALL,
+    recorded_releases: list[str] | None = None,
+) -> list[str]:
     recorded: list[list[str]] = []
 
     def fake_compute_specs(args: Any) -> list[CommandWorkerSpec]:
         recorded.append(list(args.argv))
         return [_router()]
 
+    def fake_parse_args() -> SimpleNamespace:
+        argv = list(sys.argv[1:])
+        declared = declared_deploy_components(argv)
+        return SimpleNamespace(
+            colocate=False, deploy_component=declared[-1] if declared else DeployComponent.ALL.value, argv=argv
+        )
+
     monkeypatch.setattr(entrypoint, "compute_specs", fake_compute_specs)
-    monkeypatch.setattr(entrypoint, "parse_args", lambda: SimpleNamespace(colocate=False, argv=list(sys.argv[1:])))
+    monkeypatch.setattr(entrypoint, "parse_args", fake_parse_args)
     monkeypatch.setattr(MooncakeInfo, "plan_of_args", staticmethod(lambda args: None))
     monkeypatch.setattr(entrypoint, "_write_helm_values", lambda path, values: None)
     monkeypatch.setattr(Helm, "get_manifest", staticmethod(lambda release, namespace: None))
     monkeypatch.setattr(entrypoint, "_remove_pending_uninstall", lambda release, *, namespace: None)
     monkeypatch.setattr(Helm, "build_dependencies", lambda chart: None)
-    monkeypatch.setattr(Helm, "upgrade", lambda **kwargs: None)
+
+    def fake_upgrade(**kwargs: Any) -> None:
+        if recorded_releases is not None:
+            recorded_releases.append(kwargs["release"])
+
+    monkeypatch.setattr(Helm, "upgrade", staticmethod(fake_upgrade))
     monkeypatch.setattr(entrypoint, "_follow_until_finished", lambda **kwargs: None)
 
-    KubernetesCommandBackend(_config(run_id)).execute_train(
+    KubernetesCommandBackend(_config(run_id, deploy_component)).execute_train(
         train_args=f"--train-backend fsdp {train_args}", num_gpus_per_node=8, megatron_model_type=None
     )
     assert len(recorded) == 1
@@ -181,3 +210,96 @@ class TestThePodDispatchesOnThatFlag:
         assert wiring.get_backend_capability(args) is stub.capability
         assert stub.specs_computed_from == [args]
         assert ClusterBackend(declared[0]) is ClusterBackend.KUBERNETES
+
+
+class TestExecuteTrainTellsThePodsWhichPartOfTheRunTheyAre:
+    def test_a_whole_run_is_told_nothing_so_every_existing_launch_is_unchanged(self, monkeypatch: pytest.MonkeyPatch):
+        """`all` is the default on both sides, and adding the flag to every launch would move every rendered name."""
+        argv = launch_argv(monkeypatch, train_args="--rollout-num-gpus 8")
+
+        assert declared_deploy_components(argv) == []
+
+    def test_the_train_argv_names_the_part_the_launch_deploys(self, monkeypatch: pytest.MonkeyPatch):
+        """The pods filter the run's spec table by this flag, so it is what makes them a subset of the run."""
+        argv = launch_argv(monkeypatch, train_args="--rollout-num-gpus 8", deploy_component=DeployComponent.TRAINER)
+
+        assert declared_deploy_components(argv) == ["trainer"]
+
+    def test_the_release_is_named_after_the_part_it_installs(self, monkeypatch: pytest.MonkeyPatch):
+        """Two parts of one run id share a release name unless the part is in it, and would uninstall each other."""
+        releases: list[str] = []
+
+        launch_argv(
+            monkeypatch,
+            train_args="--rollout-num-gpus 8",
+            deploy_component=DeployComponent.TRAINER,
+            recorded_releases=releases,
+        )
+
+        assert releases == [f"miles-run-{RUN_ID}-trainer"]
+
+    def test_every_object_of_a_split_release_is_named_after_that_release(self, monkeypatch: pytest.MonkeyPatch):
+        """The chart computes no names, so an object named after the whole run would collide with the whole run."""
+        releases: list[str] = []
+        argv = launch_argv(
+            monkeypatch,
+            train_args="--rollout-num-gpus 8",
+            deploy_component=DeployComponent.TRAINER,
+            recorded_releases=releases,
+        )
+
+        run = _values_of_release(argv, release=releases[0])["run"]
+
+        assert run["objectNames"]["orchestrator"] == f"miles-run-{RUN_ID}-trainer-orchestrator"
+        assert run["staticWorkers"][0]["objectName"] == f"miles-run-{RUN_ID}-trainer-inference-router-0"
+
+    def test_a_user_supplied_agreeing_flag_is_not_repeated(self, monkeypatch: pytest.MonkeyPatch):
+        """A relaunch from a recorded command line already carries the flag the launcher would add."""
+        argv = launch_argv(
+            monkeypatch,
+            train_args="--deploy-component trainer --rollout-num-gpus 8",
+            deploy_component=DeployComponent.TRAINER,
+        )
+
+        assert declared_deploy_components(argv) == ["trainer"]
+
+    def test_a_user_supplied_conflicting_flag_stops_the_launch(self, monkeypatch: pytest.MonkeyPatch):
+        """Everything this launch installs is named after its own part, so pods told another part are orphans."""
+        with pytest.raises(AssertionError, match="deploy-component"):
+            launch_argv(monkeypatch, train_args="--deploy-component inference --rollout-num-gpus 8")
+
+
+class TestApiServerHost:
+    def test_a_whole_run_answers_on_its_own_orchestrator(self):
+        """The api server runs beside the orchestration script, which is a pod of the run's only release."""
+        host = KubernetesCommandBackend(_config()).api_server_host()
+
+        assert host == f"miles-run-{RUN_ID}-orchestrator.{NAMESPACE}.svc.cluster.local"
+
+    def test_a_primary_deployment_answers_on_the_orchestrator_of_its_own_release(self):
+        """Its release carries the component suffix, and the unsuffixed name is another release entirely."""
+        host = KubernetesCommandBackend(_config(deploy_component=DeployComponent.PRIMARY)).api_server_host()
+
+        assert host == f"miles-run-{RUN_ID}-primary-orchestrator.{NAMESPACE}.svc.cluster.local"
+
+    @pytest.mark.parametrize("component", [DeployComponent.TRAINER, DeployComponent.INFERENCE])
+    def test_a_deployment_without_the_orchestration_script_has_no_api_server_to_name(self, component):
+        """Answering with a host that runs no api server would time out instead of saying what is wrong."""
+        backend = KubernetesCommandBackend(_config(deploy_component=component))
+
+        with pytest.raises(AssertionError, match="orchestration script"):
+            backend.api_server_host()
+
+
+def _values_of_release(train_argv: list[str], *, release: str) -> dict[str, Any]:
+    return build_values(
+        [_router()],
+        LaunchPlan(
+            run_id=RUN_ID,
+            state_file="",
+            release=release,
+            namespace=NAMESPACE,
+            orchestrator_command=[],
+            worker_argv=train_argv,
+        ),
+    ).as_values()

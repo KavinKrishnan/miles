@@ -122,6 +122,12 @@ it to Ray's own reference counting.
   collector, the platform's own dashboards — sees them with no wiring from Miles.
 - Prefer it at scale. The built-in following is meant for watching one run, not hundreds of pods.
 
+## One run, several deployments
+
+A launch installs one release holding every worker of the run. `--deploy-component` splits that into a
+release per part — trainer, inference side, everything else — each installed by its own launch and
+uninstalled on its own. See [Split deployment](/advanced/split-deployment).
+
 ## Clean up
 
 ```bash

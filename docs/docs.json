@@ -232,7 +232,8 @@
        {
         "group": "Cluster & Deployment",
         "pages": [
-         "advanced/cluster-backend"
+         "advanced/cluster-backend",
+         "advanced/split-deployment"
         ],
         "expanded": false
        }

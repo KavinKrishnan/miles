@@ -7,8 +7,10 @@ from miles.ray.specs.inference import (
     compute_session_server_instance_id,
     session_server_worker_name,
 )
+from miles.ray.specs.static_addrs import static_router_addrs
 from miles.utils.http_utils import wait_tcp_ready
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.simple import wait_static_addrs_ready
 from miles.utils.workers.worker_spec import HostAndPort
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,12 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
     A second call in the same process answers from the record, so the driver and an
     in-process controller may both resolve the same ``args``.
     """
+    if (static_addrs := static_router_addrs(args)) is not None:
+        wait_static_addrs_ready(static_addrs.values())
+        logger.info(f"Statically addressed routers ready at {static_addrs}")
+        _record_router_addrs(args, router_addrs=static_addrs)
+        return static_addrs
+
     if args.sglang_router_ip is not None:
         assert args.sglang_model_routers is not None, (
             "external router mode was removed: miles always resolves its own routers "
@@ -37,12 +45,16 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
         for model_idx, model_cfg in enumerate(config.models)
     }
 
-    primary = router_addrs[config.models[0].name]
+    _record_router_addrs(args, router_addrs=router_addrs)
+
+    return router_addrs
+
+
+def _record_router_addrs(args, *, router_addrs: dict[str, HostAndPort]) -> None:
+    primary = next(iter(router_addrs.values()))
     args.sglang_router_ip = primary.host
     args.sglang_router_port = primary.port
     args.sglang_model_routers = {name: (addr.host, addr.port) for name, addr in router_addrs.items()}
-
-    return router_addrs
 
 
 async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> HostAndPort:

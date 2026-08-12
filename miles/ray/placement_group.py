@@ -15,7 +15,11 @@ from miles.ray.specs.inference import (
 from miles.ray.specs.rollout import create_rollout_executor_handle
 from miles.ray.specs.train import compute_critic_args, create_trainer_controller_handle
 from miles.ray.wiring import get_backend_capability
+from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
+from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
+from miles.utils.audit_utils.event_logger.models import InferenceEngineWeightChecksumEvent
 from miles.utils.ft_utils.api_server.server import start_api_server
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 
 logger = logging.getLogger(__name__)
@@ -98,6 +102,14 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
+    component = DeployComponent(args.deploy_component)
+    if component is DeployComponent.PRIMARY:
+        return 0, 0
+    if component is DeployComponent.TRAINER:
+        return actor_num_gpus, 0
+    if component is DeployComponent.INFERENCE:
+        return args.rollout_num_gpus + args.eval_num_gpus, 0
+
     if args.debug_train_only:
         return actor_num_gpus, 0
     if args.rollout_external:
@@ -136,11 +148,11 @@ async def create_training_models(
 ) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
     capability = get_backend_capability(args)
 
-    actor_model = create_trainer_controller_handle(capability=capability, role="actor")
+    actor_model = create_trainer_controller_handle(args, capability=capability, role="actor")
     actor_start_rollout_ids = await actor_model.init(args)
 
     if args.use_critic:
-        critic_model = create_trainer_controller_handle(capability=capability, role="critic")
+        critic_model = create_trainer_controller_handle(args, capability=capability, role="critic")
         critic_start_rollout_ids = await critic_model.init(compute_critic_args(args))
     else:
         critic_model = None
@@ -158,9 +170,44 @@ async def create_training_models(
 
 
 # TODO: move (when reorganizing files)
-async def update_weights(actor_model, rollout_executor, *, rollout_id: int | None = None) -> None:
-    if (weight_version := await actor_model.update_weights(rollout_id=rollout_id)) is not None:
+async def update_weights(
+    args,
+    *,
+    actor_model: BaseWorkerHandle,
+    rollout_executor: BaseWorkerHandle,
+    inference_controller: BaseWorkerHandle,
+    rollout_id: int | None = None,
+) -> None:
+    """Sequence the weight update: the controllers never call each other, the orchestration script does."""
+    info = await inference_controller.start_update_weights()
+    try:
+        weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id)
+    except BaseException:
+        await inference_controller.abort_update_weights()
+        raise
+    await inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+
+    await _maybe_log_inference_engine_weight_checksums(
+        args, inference_controller=inference_controller, rollout_id=rollout_id
+    )
+
+    if weight_version is not None:
         await rollout_executor.set_weight_version(weight_version)
+
+
+async def _maybe_log_inference_engine_weight_checksums(
+    args, *, inference_controller: BaseWorkerHandle, rollout_id: int | None
+) -> None:
+    if not is_event_logger_initialized():
+        return
+    if args.debug_train_only or args.debug_rollout_only:
+        return
+
+    check_weights_result = await inference_controller.check_weights(action="checksum")
+    get_event_logger().log(
+        InferenceEngineWeightChecksumEvent,
+        dict(rollout_id=rollout_id, engine_checksums=flatten_inference_engine_checksums(check_weights_result)),
+    )
 
 
 # TODO: move (when reorganizing files)
@@ -196,7 +243,7 @@ async def create_rollout_components(args) -> RolloutComponents:
         )
         await wait_session_server_ready(args, provider=session_server_provider)
 
-    inference_controller = create_inference_controller_handle(capability=capability)
+    inference_controller = create_inference_controller_handle(args, capability=capability)
     await inference_controller.init()
 
     rollout_executor = create_rollout_executor_handle(capability=capability)

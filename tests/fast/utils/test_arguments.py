@@ -13,6 +13,7 @@ from miles.utils.arguments import (
     _compute_custom_inference_engine_provider_path,
     _compute_rollout_external,
     _maybe_apply_dumper_overrides,
+    _resolve_api_server_port,
     _resolve_ft_components,
     _resolve_mini_ft_controller_enable,
     _resolve_rollout_functions,
@@ -21,6 +22,7 @@ from miles.utils.arguments import (
     miles_validate_args,
     resolve_rollout_function_paths,
     validate_async_off_policy_correction,
+    validate_deploy_component,
 )
 from miles.utils.env_report.redaction import _SECRET_ARG_NAMES, _SECRET_ENV_VAR_PATTERN
 from miles.utils.ft_utils.health_checker import SimpleHealthCheckerConfig
@@ -522,6 +524,259 @@ def test_sglang_parallel_sizes_keep_server_args_destinations():
     assert args.sglang_pp_size == 3
     assert args.sglang_ep_size == 4
     assert args.sglang_attn_cp_size == 5
+
+
+_SHARED_STORE_ARGS = [
+    "--object-store-backend",
+    "mooncake",
+    "--mooncake-store-init-kwargs",
+    '{"master_server_address": "the-master:50051"}',
+]
+
+
+class TestDeployComponent:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        args = parser.parse_args(extra + REQUIRED_ARGS + ["--num-rollout", "1"])
+        args.ft_components = []
+        args.mini_ft_controller_enable = False
+        return args
+
+    def _parse_validated(self, extra):
+        args = self._parse(extra)
+        args.ft_components = _resolve_ft_components(args)
+        args.api_server_port = _resolve_api_server_port(args)
+        args.mini_ft_controller_enable = _resolve_mini_ft_controller_enable(args)
+        return args
+
+    def test_defaults_to_deploying_the_whole_run(self):
+        """A run that does not mention the flag is one deployment, exactly as before the flag existed."""
+        assert self._parse([]).deploy_component == "all"
+
+    def test_rejects_a_component_that_is_not_one_of_the_four(self):
+        """The four values partition the run, so a fifth name would deploy an undefined subset."""
+        with pytest.raises(SystemExit):
+            self._parse(["--deploy-component", "router"])
+
+    @pytest.mark.parametrize("component", ["trainer", "inference"])
+    def test_a_deployment_without_the_orchestration_script_needs_no_addresses(self, component):
+        """It calls nobody: the orchestration script calls it, so it has nothing to be told."""
+        validate_deploy_component(self._parse(["--deploy-component", component, *_SHARED_STORE_ARGS]))
+
+    @pytest.mark.parametrize("component", ["trainer", "inference"])
+    def test_a_deployment_without_the_orchestration_script_has_to_share_an_object_store(self, component):
+        """A ray reference is redeemable only inside the deployment that made it, and the data crosses deployments."""
+        with pytest.raises(AssertionError, match="--object-store-backend"):
+            validate_deploy_component(self._parse(["--deploy-component", component, "--object-store-backend", "ray"]))
+
+    def test_a_deployment_without_the_orchestration_script_has_to_be_told_where_the_store_master_is(self):
+        """It runs no master of its own, so an unnamed one leaves it writing into a store nobody else reads."""
+        with pytest.raises(AssertionError, match="master_server_address"):
+            validate_deploy_component(
+                self._parse(["--deploy-component", "trainer", "--object-store-backend", "mooncake"])
+            )
+
+    def test_the_store_master_address_has_to_carry_a_port(self):
+        """A host without a port cannot be dialed, and the failure would surface as a hang much later."""
+        with pytest.raises(AssertionError, match="master_server_address"):
+            validate_deploy_component(
+                self._parse(
+                    [
+                        "--deploy-component",
+                        "trainer",
+                        "--object-store-backend",
+                        "mooncake",
+                        "--mooncake-store-init-kwargs",
+                        '{"master_server_address": "the-master"}',
+                    ]
+                )
+            )
+
+    def test_a_deployment_told_where_the_store_master_is_validates(self):
+        """This is what makes the trainer read the rollout data the orchestration script's deployment wrote."""
+        validate_deploy_component(
+            self._parse(
+                [
+                    "--deploy-component",
+                    "trainer",
+                    "--object-store-backend",
+                    "mooncake",
+                    "--mooncake-store-init-kwargs",
+                    '{"master_server_address": "the-master:50051"}',
+                ]
+            )
+        )
+
+    def test_a_primary_deployment_has_to_be_told_where_the_trainer_is(self):
+        """Nothing derives another release's pod names, so an unnamed trainer is unreachable."""
+        with pytest.raises(AssertionError, match="--trainer-controller-addrs"):
+            validate_deploy_component(self._parse(["--deploy-component", "primary"]))
+
+    def test_a_primary_deployment_has_to_be_told_where_the_inference_side_is(self):
+        """Same for the inference controller, which the weight update window is opened on."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            validate_deploy_component(
+                self._parse(["--deploy-component", "primary", "--trainer-controller-addrs", "10.0.0.1:8000"])
+            )
+
+    def test_a_primary_deployment_has_to_be_told_where_the_routers_are(self):
+        """The rollout executor generates through the router, which lives with the engines it fronts."""
+        with pytest.raises(AssertionError, match="--inference-router-addrs"):
+            validate_deploy_component(
+                self._parse(
+                    [
+                        "--deploy-component",
+                        "primary",
+                        "--trainer-controller-addrs",
+                        "10.0.0.1:8000",
+                        "--inference-controller-addrs",
+                        "10.0.0.2:8000",
+                    ]
+                )
+            )
+
+    def test_a_fully_addressed_primary_deployment_validates(self):
+        """The three flags together are what makes an orchestration script able to run without its workers."""
+        validate_deploy_component(
+            self._parse(
+                [
+                    "--deploy-component",
+                    "primary",
+                    "--trainer-controller-addrs",
+                    "10.0.0.1:8000",
+                    "--inference-controller-addrs",
+                    "10.0.0.2:8000",
+                    "--inference-router-addrs",
+                    "10.0.0.3:8000",
+                    *_SHARED_STORE_ARGS,
+                ]
+            )
+        )
+
+    def test_a_primary_deployment_shares_an_object_store_too(self):
+        """It writes the rollout data the trainer deployment reads, which its own store alone cannot carry."""
+        with pytest.raises(AssertionError, match="--object-store-backend"):
+            validate_deploy_component(
+                self._parse(
+                    [
+                        "--deploy-component",
+                        "primary",
+                        "--trainer-controller-addrs",
+                        "10.0.0.1:8000",
+                        "--inference-controller-addrs",
+                        "10.0.0.2:8000",
+                        "--inference-router-addrs",
+                        "10.0.0.3:8000",
+                        "--object-store-backend",
+                        "ray",
+                    ]
+                )
+            )
+
+    def test_a_train_only_run_still_has_to_be_told_where_the_inference_controller_is(self):
+        """The orchestration script builds its handle and calls init on it whether or not engines are deployed."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            validate_deploy_component(
+                self._parse(
+                    [
+                        "--deploy-component",
+                        "primary",
+                        "--trainer-controller-addrs",
+                        "10.0.0.1:8000",
+                        "--debug-train-only",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
+
+    def test_a_train_only_run_needs_no_router_addresses(self):
+        """--debug-train-only deploys no engines and no routers, so no router is ever resolved."""
+        validate_deploy_component(
+            self._parse(
+                [
+                    "--deploy-component",
+                    "primary",
+                    "--trainer-controller-addrs",
+                    "10.0.0.1:8000",
+                    "--inference-controller-addrs",
+                    "10.0.0.2:8000",
+                    "--debug-train-only",
+                    *_SHARED_STORE_ARGS,
+                ]
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("component", "flag"),
+        [
+            ("trainer", "--trainer-controller-addrs"),
+            ("inference", "--inference-controller-addrs"),
+            ("inference", "--inference-router-addrs"),
+            ("all", "--trainer-controller-addrs"),
+            ("all", "--inference-controller-addrs"),
+            ("all", "--inference-router-addrs"),
+        ],
+    )
+    def test_refuses_a_static_address_for_a_component_this_launch_deploys_itself(self, component, flag):
+        """A static address describes what another launch deploys, so one for our own release is a contradiction."""
+        with pytest.raises(AssertionError, match=flag):
+            validate_deploy_component(
+                self._parse(["--deploy-component", component, flag, "10.0.0.1:8000", *_SHARED_STORE_ARGS])
+            )
+
+    @pytest.mark.parametrize(
+        ("component", "flag"),
+        [
+            ("trainer", "--inference-controller-addrs"),
+            ("inference", "--trainer-controller-addrs"),
+        ],
+    )
+    def test_allows_a_static_address_for_a_component_another_launch_deploys(self, component, flag):
+        """That component is outside this release either way, so naming it is at worst unused, never wrong."""
+        validate_deploy_component(
+            self._parse(["--deploy-component", component, flag, "10.0.0.1:8000", *_SHARED_STORE_ARGS])
+        )
+
+    def test_refuses_an_api_server_that_answers_for_cells_another_deployment_owns(self):
+        """It reads cells of its own release, so a split run's would come back missing instead of unreachable."""
+        with pytest.raises(AssertionError, match="--api-server-port"):
+            validate_deploy_component(
+                self._parse_validated(
+                    [
+                        "--deploy-component",
+                        "primary",
+                        "--trainer-controller-addrs",
+                        "10.0.0.1:8000",
+                        "--inference-controller-addrs",
+                        "10.0.0.2:8000",
+                        "--inference-router-addrs",
+                        "10.0.0.3:8000",
+                        "--use-fault-tolerance",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
+
+    def test_a_trainer_deployment_keeps_the_fault_tolerance_of_its_own_cells(self):
+        """Its controller watches its own ranks, and it runs no api server to be blind with."""
+        validate_deploy_component(
+            self._parse_validated(
+                [
+                    "--deploy-component",
+                    "trainer",
+                    "--use-fault-tolerance",
+                    "--ft-components",
+                    "train",
+                    *_SHARED_STORE_ARGS,
+                ]
+            )
+        )
+
+    def test_refuses_to_split_a_colocated_run(self):
+        """Colocated trainers and engines share gpus, so they can only be installed as one unit."""
+        with pytest.raises(AssertionError, match="--colocate"):
+            validate_deploy_component(self._parse(["--deploy-component", "trainer", "--colocate"]))
 
 
 class TestEvalSglangOverrides:

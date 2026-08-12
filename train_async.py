@@ -1,7 +1,7 @@
-import asyncio
 import logging
 import os
 
+from miles.ray.deployment import run_deployment
 from miles.ray.placement_group import (
     create_rollout_components,
     create_training_models,
@@ -46,7 +46,12 @@ async def train(args):
     maybe_start_mini_ft_controller(args)
 
     # always update weight first so that sglang has the loaded weights from training.
-    await update_weights(actor_model, rollout_executor)
+    await update_weights(
+        args,
+        actor_model=actor_model,
+        rollout_executor=rollout_executor,
+        inference_controller=inference_controller,
+    )
 
     if args.check_weight_update_equal:
         await inference_controller.check_weights(
@@ -113,7 +118,13 @@ async def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
-            await update_weights(actor_model, rollout_executor, rollout_id=rollout_id)
+            await update_weights(
+                args,
+                actor_model=actor_model,
+                rollout_executor=rollout_executor,
+                inference_controller=inference_controller,
+                rollout_id=rollout_id,
+            )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
             await inference_controller.prepare_eval()
@@ -141,6 +152,6 @@ async def train(args):
 if __name__ == "__main__":
     args = parse_args()
     try:
-        asyncio.run(train(args))
+        run_deployment(args, run_orchestration_script=train)
     finally:
         finish_tracking()

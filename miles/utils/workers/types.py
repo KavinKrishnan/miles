@@ -11,6 +11,23 @@ class WorkerCommBackend(Enum):
     RPC = "rpc"
 
 
+class DeployComponent(Enum):
+    ALL = "all"
+    PRIMARY = "primary"
+    TRAINER = "trainer"
+    INFERENCE = "inference"
+
+    def selects(self, component: "DeployComponent") -> bool:
+        assert component is not DeployComponent.ALL, "`all` is a selector over components, never a component itself"
+        return self is DeployComponent.ALL or self is component
+
+    def deploys_orchestration_script(self) -> bool:
+        return self.selects(DeployComponent.PRIMARY)
+
+    def is_split(self) -> bool:
+        return self is not DeployComponent.ALL
+
+
 _SUPPORTED_WORKER_COMM_BACKENDS = {
     ClusterBackend.RAY: (WorkerCommBackend.RAY, WorkerCommBackend.RPC),
     ClusterBackend.KUBERNETES: (WorkerCommBackend.RPC,),

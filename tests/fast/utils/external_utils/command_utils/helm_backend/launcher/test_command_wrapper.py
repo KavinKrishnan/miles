@@ -7,6 +7,7 @@ from miles.utils.external_utils.command_utils.common import chart_dir
 from miles.utils.external_utils.command_utils.helm_backend.launcher import command_wrapper, entrypoint
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Helm, Kubectl
 from miles.utils.external_utils.command_utils.helm_backend.naming import RunNames
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_provider.kubernetes.helm import naming
 from miles.utils.workers.worker_provider.kubernetes.helm.env import INSTANCE_LABEL
 
@@ -149,7 +150,7 @@ def _recorded_ci_cleanup(monkeypatch, namespace: str, *, listed: list[dict] | No
         return subprocess.CompletedProcess(args=command, returncode=0, stdout=json.dumps(listed or []), stderr="")
 
     monkeypatch.setattr(command_wrapper, "_run", fake_run)
-    entrypoint._uninstall_leftover_ci_releases(namespace)
+    entrypoint._uninstall_leftover_ci_releases(namespace, keep_run_id="260101-000000-999")
     return commands
 
 
@@ -195,6 +196,21 @@ class TestReleaseName:
     def test_the_same_run_id_always_names_the_same_release(self):
         """Relaunching a run upgrades its release; a fresh name would deploy a second copy instead."""
         assert RunNames.release(run_id=LONGEST_RUN_ID) == RunNames.release(run_id=LONGEST_RUN_ID)
+
+    @pytest.mark.parametrize(
+        "component", [DeployComponent.PRIMARY, DeployComponent.TRAINER, DeployComponent.INFERENCE]
+    )
+    def test_a_part_of_a_run_is_a_release_of_its_own(self, component):
+        """The parts of one run id are installed separately, and one name would make each uninstall the last."""
+        release = RunNames.release(run_id="260101-000000-000", deploy_component=component)
+
+        assert release == f"miles-run-260101-000000-000-{component.value}"
+
+    def test_a_whole_run_keeps_the_name_it_always_had(self):
+        """Every unsplit run, and every tool that finds one, still resolves the release from the run id alone."""
+        assert RunNames.release(run_id="260101-000000-000", deploy_component=DeployComponent.ALL) == RunNames.release(
+            run_id="260101-000000-000"
+        )
 
 
 class TestComponentName:

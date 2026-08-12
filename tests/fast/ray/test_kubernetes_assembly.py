@@ -227,6 +227,10 @@ def cell_pods(count: int) -> list[Pod]:
 def rollout_executor_args() -> SimpleNamespace:
     return SimpleNamespace(
         cluster_backend="kubernetes",
+        deploy_component="all",
+        trainer_controller_addrs=None,
+        inference_controller_addrs=None,
+        inference_router_addrs=None,
         pin_rollout_manager_to_head=False,
         debug_train_only=True,
         use_critic=False,
@@ -474,7 +478,9 @@ class TestKubernetesDriverAssembly:
             async with httpx.AsyncClient(transport=transport) as client:
                 monkeypatch.setattr(http_utils.GeneralHttpClientProvider, "client", classmethod(lambda cls: client))
                 await app.router.lifespan_context(app).__aenter__()
-                handle = specs_train.create_trainer_controller_handle(capability=capability, role="actor")
+                handle = specs_train.create_trainer_controller_handle(
+                    rollout_executor_args(), capability=capability, role="actor"
+                )
                 assert await handle.init(Namespace(num_rollout=7)) == [5]
                 await handle.train(rollout_id=3, rollout_data_pack={"sample_indices": [0], "data_ref": "ref-3"})
                 return handle, await handle.get_train_parallel_config()

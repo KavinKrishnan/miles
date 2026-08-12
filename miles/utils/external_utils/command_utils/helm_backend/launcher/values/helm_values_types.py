@@ -74,7 +74,7 @@ class ObjectNames(ValuesModel):
 
 class AutoUninstallSection(ValuesModel):
     enabled: bool
-    service_account: _ObjectName
+    service_account: _ObjectName | None = None
 
 
 class OrchestratorSection(ValuesModel):
@@ -91,7 +91,7 @@ class MooncakeSection(ValuesModel):
 
 class RunValues(ValuesModel):
     id: Annotated[str, Field(max_length=_POOL_NAME_MAX, pattern=_DNS_LABEL)]
-    state_file: Annotated[str, Field(min_length=1, pattern="^/")]
+    state_file: Annotated[str, Field(min_length=1, pattern="^/")] | None = None
     launch_record: Annotated[str, Field(min_length=1, pattern="^/")] | None = None
     object_names: ObjectNames
     orchestrator: OrchestratorSection | None = None

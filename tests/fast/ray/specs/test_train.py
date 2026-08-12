@@ -384,8 +384,8 @@ class TestSpecTrainerController:
         assert capability.requested_pool_ids == [["trainer-engine-actor"], ["trainer-engine-critic"]]
         assert [entry["cell_provider"] for entry in kwargs] == [capability.cells_provider] * 2
 
-    def test_only_the_actor_controller_drives_the_inference_controller(self):
-        """Weight updates flow from the actor; a critic asking for engines would fight it."""
+    def test_no_controller_is_handed_the_inference_controller(self):
+        """The weight update is sequenced by the orchestration script, so the two controllers never link up."""
         capability = _controller_providers()
 
         args = _make_args(use_critic=True)
@@ -393,9 +393,9 @@ class TestSpecTrainerController:
         actor_kwargs = actor_spec.ctor_kwargs(_controller_context(capability))
         critic_kwargs = critic_spec.ctor_kwargs(_controller_context(capability))
 
-        assert capability.requested_static_pool_ids == ["inference-controller"]
-        assert actor_kwargs["inference_controller"] is capability.static_provider
-        assert critic_kwargs["inference_controller"] is None
+        assert capability.requested_static_pool_ids == []
+        assert "inference_controller" not in actor_kwargs
+        assert "inference_controller" not in critic_kwargs
 
     def test_the_run_shape_flags_are_resolved_by_the_spec(self):
         """These are functions of args, so the worker can answer them from the argv it parses itself."""

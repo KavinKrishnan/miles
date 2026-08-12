@@ -1,40 +1,11 @@
 from argparse import Namespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from tests.fast.ray.rollout.conftest import make_args
 
 from miles.ray.rollout.inference_controller import InferenceController
 from miles.utils.context_lock import ContextLock
-
-
-class _OrderRecordingInferenceController:
-    def __init__(self, order: list[str]):
-        self._order = order
-        self.calls: list[tuple[str, tuple, dict]] = []
-        self.results: dict[str, MagicMock] = {}
-
-    def __getattr__(self, name: str):
-        recorder = self
-
-        async def _method(*args, **kwargs):
-            recorder._order.append(name)
-            recorder.calls.append((name, args, kwargs))
-            result = MagicMock()
-            recorder.results[name] = result
-            return result
-
-        return _method
-
-
-def _assert_the_snapshot_is_handed_back_unchanged(controller: _OrderRecordingInferenceController) -> None:
-    end_kwargs: list[dict] = [kwargs for name, _args, kwargs in controller.calls if name == "end_update_weights"]
-
-    assert len(end_kwargs) == 1
-    assert (
-        end_kwargs[0]["snapshot_cell_id_to_hashes"]
-        is controller.results["start_update_weights"].snapshot_cell_id_to_hashes
-    )
 
 
 class _ColocatedCellStub:
@@ -112,42 +83,33 @@ async def test_start_update_weights_initializes_colocated_cells_before_snapshott
     assert init_counts_at_snapshot == [1]
 
 
-def _make_controller(order: list[str]):
-    from miles.ray.train.group import TrainerController
+@pytest.mark.asyncio
+async def test_aborting_the_window_releases_the_lock_and_resumes_health_checking():
+    """A release that survives the orchestration script must not keep a failed update's lock forever."""
+    controller = _make_inference_controller()
+    controller.servers = {}
 
-    group = TrainerController.__new__(TrainerController)
-    group.args = Namespace(debug_train_only=False, debug_rollout_only=False)
-    group._inference_controller = _OrderRecordingInferenceController(order)
+    await controller.start_update_weights()
+    assert not controller._health_checker_activeness.get().active
 
-    async def _record_execute_first_alive(*args: object, **kwargs: object) -> None:
-        order.append("execute_first_alive")
+    await controller.abort_update_weights()
 
-    group._execute_first_alive = AsyncMock(side_effect=_record_execute_first_alive)
-    group._maybe_log_inference_engine_weight_checksums = AsyncMock()
-    return group
+    assert controller._health_checker_activeness.get().active
+    assert not controller.context_lock.locked
 
 
 @pytest.mark.asyncio
-async def test_the_trainer_brackets_the_broadcast_with_start_and_end_update_weights():
-    """The fault-tolerant trainer runs the actual update RPC strictly inside the update window."""
-    order: list[str] = []
-    group = _make_controller(order)
+async def test_a_window_closed_by_an_abort_can_be_opened_again():
+    """A hot restart opens a second window on the same release, which a leaked lock would block forever."""
+    controller = _make_inference_controller()
+    controller.servers = {}
 
-    await group.update_weights()
+    await controller.start_update_weights()
+    await controller.abort_update_weights()
+    await controller.start_update_weights()
+    await controller.end_update_weights(snapshot_cell_id_to_hashes={})
 
-    assert order == ["start_update_weights", "execute_first_alive", "end_update_weights"]
-    group._execute_first_alive.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_the_trainer_hands_end_update_weights_the_snapshot_start_returned():
-    """The snapshot start_update_weights returned is handed back to end_update_weights unchanged."""
-    order: list[str] = []
-    group = _make_controller(order)
-
-    await group.update_weights()
-
-    _assert_the_snapshot_is_handed_back_unchanged(group._inference_controller)
+    assert not controller.context_lock.locked
 
 
 def test_fsdp_updater_flushes_only_after_every_engine_is_paused():

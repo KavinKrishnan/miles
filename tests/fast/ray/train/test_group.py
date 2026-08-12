@@ -56,7 +56,6 @@ def _make_controller(
     *,
     num_cells: int = 3,
     actor_count_per_cell: int = 1,
-    inference_controller: object | None = None,
 ) -> TrainerController:
     """Create a TrainerController and let it observe every cell, as the watcher would."""
     train_conftest.fake_worker_manager.num_cells = num_cells
@@ -66,7 +65,6 @@ def _make_controller(
         with_ref=False,
         cell_provider=make_provider(),
         cell_operations=MagicMock(),
-        inference_controller=inference_controller,
     )
     group.args = _make_mock_args(indep_dp=True, gpus_per_cell=actor_count_per_cell, num_cells=num_cells)
     group._health_checker_config = compute_trainer_health_checker_config(
@@ -997,92 +995,6 @@ class TestLogStepEndEvent:
             assert cell_outcomes[2] == [TrainStepOutcome.NORMAL]
 
 
-def _checksum_response(engine_checksums: list[dict[str, str]]) -> list:
-    """Build a flat per-engine check_weights('checksum') response."""
-    return [
-        {
-            "success": True,
-            "message": "ok",
-            "ranks": [{"checksums": cs, "parallelism_info": [{"role": "target", "rank": 0}]}],
-        }
-        for cs in engine_checksums
-    ]
-
-
-class TestMaybeLogInferenceEngineWeightChecksums:
-    async def test_no_event_logger_does_not_call_check_weights(self):
-        """Without an initialized event logger, no check_weights request is issued."""
-        inference_ctl = MagicMock()
-        inference_ctl.check_weights = MagicMock()
-        group = _make_controller(num_cells=1, inference_controller=inference_ctl)
-
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=False):
-            await group._maybe_log_inference_engine_weight_checksums(rollout_id=0)
-
-        inference_ctl.check_weights.assert_not_called()
-
-    async def test_none_rollout_id_logs_event(self):
-        """The initial out-of-loop sync (rollout_id=None) still logs an event with rollout_id=None."""
-        inference_ctl = MagicMock()
-        inference_ctl.check_weights = AsyncMock(return_value=_checksum_response([{"w": "e0"}]))
-        group = _make_controller(num_cells=1, inference_controller=inference_ctl)
-
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=True), patch(
-            "miles.ray.train.group.get_event_logger"
-        ) as mock_get_logger:
-            mock_logger = MagicMock()
-            mock_get_logger.return_value = mock_logger
-
-            await group._maybe_log_inference_engine_weight_checksums(rollout_id=None)
-
-        mock_logger.log.assert_called_once()
-        logged = mock_logger.log.call_args.args[1]
-        assert logged == dict(rollout_id=None, engine_checksums=[{"rank0/w": "e0"}])
-
-    async def test_debug_train_only_skips_collection(self):
-        """Without real rollout engines (debug_train_only), no check_weights request is issued."""
-        inference_ctl = MagicMock()
-        inference_ctl.check_weights = MagicMock()
-        group = _make_controller(num_cells=1, inference_controller=inference_ctl)
-        group.args.debug_train_only = True
-
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=True):
-            await group._maybe_log_inference_engine_weight_checksums(rollout_id=0)
-
-        inference_ctl.check_weights.assert_not_called()
-
-    async def test_debug_rollout_only_skips_collection(self):
-        """Without real train engines pushing weights (debug_rollout_only), no check_weights request is issued."""
-        inference_ctl = MagicMock()
-        inference_ctl.check_weights = MagicMock()
-        group = _make_controller(num_cells=1, inference_controller=inference_ctl)
-        group.args.debug_rollout_only = True
-
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=True):
-            await group._maybe_log_inference_engine_weight_checksums(rollout_id=0)
-
-        inference_ctl.check_weights.assert_not_called()
-
-    async def test_enabled_logs_one_event_per_rollout(self):
-        """With event logger on and real engines, one event holds every engine's checksums."""
-        inference_ctl = MagicMock()
-        inference_ctl.check_weights = AsyncMock(return_value=_checksum_response([{"w": "e0"}, {"w": "e1"}]))
-        group = _make_controller(num_cells=1, inference_controller=inference_ctl)
-
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=True), patch(
-            "miles.ray.train.group.get_event_logger"
-        ) as mock_get_logger:
-            mock_logger = MagicMock()
-            mock_get_logger.return_value = mock_logger
-
-            await group._maybe_log_inference_engine_weight_checksums(rollout_id=3)
-
-        inference_ctl.check_weights.assert_awaited_once_with(action="checksum")
-        mock_logger.log.assert_called_once()
-        logged = mock_logger.log.call_args.args[1]
-        assert logged == dict(rollout_id=3, engine_checksums=[{"rank0/w": "e0"}, {"rank0/w": "e1"}])
-
-
 class TestCellStatusesUnderConcurrentReconcile:
     def test_a_cell_removed_while_the_statuses_are_read_does_not_abort_the_read(self):
         """The api server reads this from its own thread while reconcile adds and drops cells,
@@ -1109,19 +1021,17 @@ class TestUpdateWeightsReturnsTheVersion:
     def _make_group(self, *, per_worker_versions: list[int | None]) -> TrainerController:
         group = TrainerController.__new__(TrainerController)
         group.args = SimpleNamespace(debug_train_only=False, debug_rollout_only=False)
-        group._inference_controller = AsyncMock()
         group._execute_first_alive = AsyncMock(return_value=per_worker_versions)
-        group._maybe_log_inference_engine_weight_checksums = AsyncMock()
         return group
 
     async def test_the_controller_answers_the_version_the_engines_now_serve(self):
         """The driver can only publish the version to the executor if the controller hands it back."""
         group = self._make_group(per_worker_versions=[11, 11])
 
-        assert await group.update_weights() == 11
+        assert await group.update_weights(info=MagicMock()) == 11
 
     async def test_a_trainer_that_skipped_the_broadcast_answers_nothing(self):
         """--debug-skip-weight-update returns None from every worker, which must reach the driver as None."""
         group = self._make_group(per_worker_versions=[None])
 
-        assert await group.update_weights() is None
+        assert await group.update_weights(info=MagicMock()) is None

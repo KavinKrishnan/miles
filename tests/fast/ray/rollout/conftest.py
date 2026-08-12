@@ -58,6 +58,10 @@ def make_args(**overrides: Any) -> Namespace:
         log_passrate=False,
         pin_rollout_manager_to_head=False,
         cluster_backend="ray",
+        deploy_component="all",
+        trainer_controller_addrs=None,
+        inference_controller_addrs=None,
+        inference_router_addrs=None,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,

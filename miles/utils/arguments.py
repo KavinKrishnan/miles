@@ -25,7 +25,7 @@ from miles.utils.megatron_args_utils import compute_megatron_world_size_except_d
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
-from miles.utils.workers.types import ClusterBackend, WorkerCommBackend, resolve_worker_comm_backend
+from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,51 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "How the driver calls its workers: `ray` sends actor calls, `rpc` calls the http server "
                     "every worker serves. Unset picks the default of the cluster backend, today `ray` under "
                     "`--cluster-backend ray` and `rpc` under `--cluster-backend kubernetes`."
+                ),
+            )
+            parser.add_argument(
+                "--deploy-component",
+                type=str,
+                default=DeployComponent.ALL.value,
+                choices=tuple(component.value for component in DeployComponent),
+                help=(
+                    "Which part of the run this launch deploys: `all` deploys every worker, `trainer` the trainer "
+                    "controller and its megatron ranks, `inference` the inference controller with its sglang engines "
+                    "and routers, and `primary` everything else (rollout executor, orchestration script, api server, "
+                    "session servers). Deploying a subset takes one launch per subset, and the launch that carries "
+                    "the orchestration script reaches the others through their statically given addresses."
+                ),
+            )
+            parser.add_argument(
+                "--trainer-controller-addrs",
+                type=str,
+                default=None,
+                nargs="+",
+                help=(
+                    "Address of an independently deployed trainer controller, as host:port or http://host:port, "
+                    "prefixed as <role>=<address> when the run also trains a critic. Required when this launch "
+                    "carries the orchestration script but not the trainer."
+                ),
+            )
+            parser.add_argument(
+                "--inference-controller-addrs",
+                type=str,
+                default=None,
+                nargs="+",
+                help=(
+                    "Address of an independently deployed inference controller, as host:port or http://host:port. "
+                    "Required when this launch carries the orchestration script but not the inference side."
+                ),
+            )
+            parser.add_argument(
+                "--inference-router-addrs",
+                type=str,
+                default=None,
+                nargs="+",
+                help=(
+                    "Address of the router of an independently deployed inference side, one per model, as host:port "
+                    "or http://host:port, prefixed as <model>=<address> for multi-model runs. Required together "
+                    "with --inference-controller-addrs, because the routers live with the engines they serve."
                 ),
             )
             parser.add_argument("--actor-num-nodes", type=int, default=1, help="Number of nodes for training actor")
@@ -2842,6 +2887,99 @@ def _compute_custom_inference_engine_provider_path(args: argparse.Namespace) -> 
     return _BACKEND_ENGINE_PROVIDER_PATH
 
 
+def validate_deploy_component(args: argparse.Namespace) -> None:
+    component = DeployComponent(args.deploy_component)
+
+    _validate_static_addrs_name_another_launch(args, component=component)
+
+    if not component.is_split():
+        return
+
+    assert not args.colocate, (
+        "--colocate places trainers and engines on the same gpus, so they are one deployment unit and cannot be "
+        "installed by separate launches"
+    )
+
+    if component.deploys_orchestration_script():
+        _validate_named_deployments(args, component=component)
+
+    _validate_shared_object_store(args, component=component)
+    _validate_watched_cells_are_deployed_here(args, component=component)
+
+
+def _validate_static_addrs_name_another_launch(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    given_flags_by_component: dict[DeployComponent, list[str]] = {
+        DeployComponent.TRAINER: _given_flags({"--trainer-controller-addrs": args.trainer_controller_addrs}),
+        DeployComponent.INFERENCE: _given_flags(
+            {
+                "--inference-controller-addrs": args.inference_controller_addrs,
+                "--inference-router-addrs": args.inference_router_addrs,
+            }
+        ),
+    }
+
+    for deployed, given_flags in given_flags_by_component.items():
+        assert not (component.selects(deployed) and given_flags), (
+            f"{' '.join(given_flags)} describe the {deployed.value} side that some other launch deploys, but "
+            f"--deploy-component {component.value} deploys it here, so this launch reaches it by the names of its "
+            f"own release"
+        )
+
+
+def _given_flags(flags: dict[str, list[str] | None]) -> list[str]:
+    return [flag for flag, value in flags.items() if value is not None]
+
+
+def _validate_named_deployments(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    assert args.trainer_controller_addrs is not None, (
+        f"--deploy-component {component.value} carries the orchestration script but not the trainer, so the trainer "
+        f"controller has to be named by --trainer-controller-addrs"
+    )
+    assert args.inference_controller_addrs is not None, (
+        f"--deploy-component {component.value} carries the orchestration script but not the inference side, so the "
+        f"inference controller has to be named by --inference-controller-addrs"
+    )
+    if args.debug_train_only:
+        return
+    assert args.inference_router_addrs is not None, (
+        f"--deploy-component {component.value} carries the orchestration script but not the inference side, so its "
+        f"routers have to be named by --inference-router-addrs"
+    )
+
+
+def _validate_watched_cells_are_deployed_here(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    if not component.deploys_orchestration_script():
+        return
+
+    assert not args.api_server_port, (
+        f"the api server, and the mini ft controller polling it, answer for the cells of their own deployment, so "
+        f"under --deploy-component {component.value} they would report every trainer and inference cell of the run "
+        f"as missing rather than say why; pass --api-server-port 0"
+    )
+
+
+_MOONCAKE_MASTER_ADDRESS_KEY = "master_server_address"
+
+
+def _validate_shared_object_store(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    assert ObjectStoreBackend(args.object_store_backend) == ObjectStoreBackend.MOONCAKE, (
+        f"the deployments of one run exchange rollout and training data through the object store, and a "
+        f"{args.object_store_backend} reference is only redeemable inside the deployment that created it, so "
+        f"--deploy-component {component.value} needs --object-store-backend {ObjectStoreBackend.MOONCAKE.value}"
+    )
+
+    if component.deploys_orchestration_script():
+        return
+
+    address = (args.mooncake_store_init_kwargs or {}).get(_MOONCAKE_MASTER_ADDRESS_KEY)
+    assert isinstance(address, str) and ":" in address, (
+        f"--deploy-component {component.value} shares the object store of the deployment that carries the "
+        f"orchestration script, and it runs no master of its own, so that master's address has to be named by "
+        f'--mooncake-store-init-kwargs \'{{"{_MOONCAKE_MASTER_ADDRESS_KEY}": "<host>:<port>"}}\' '
+        f"(got {address!r})"
+    )
+
+
 _FT_DEFAULT_COMPONENTS: list[str] = ["rollout"]
 
 
@@ -3602,6 +3740,8 @@ def miles_validate_args(args):
 
     if args.mini_ft_controller_enable and args.api_server_port == 0:
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
+
+    validate_deploy_component(args)
 
 
 def validate_async_off_policy_correction(args) -> None:

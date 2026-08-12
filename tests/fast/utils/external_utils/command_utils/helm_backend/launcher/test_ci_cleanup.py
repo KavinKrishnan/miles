@@ -6,6 +6,7 @@ import pytest
 from miles.utils.external_utils.command_utils.helm_backend.launcher import command_wrapper, entrypoint
 
 NAMESPACE = "rl"
+_OTHER_RUN_ID = "260101-000000-999"
 
 
 @dataclass
@@ -49,7 +50,7 @@ class TestUninstallLeftoverCiReleases:
             ],
         )
 
-        entrypoint._uninstall_leftover_ci_releases(NAMESPACE)
+        entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID)
 
         assert cluster.uninstalled() == ["ci-here"]
 
@@ -57,7 +58,7 @@ class TestUninstallLeftoverCiReleases:
         """Filtering on only one of the two would list releases the caller must never touch."""
         cluster = _cluster(monkeypatch, [])
 
-        entrypoint._uninstall_leftover_ci_releases(NAMESPACE)
+        entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID)
 
         listing = cluster.commands[0]
         assert listing[listing.index("--namespace") + 1] == NAMESPACE
@@ -70,7 +71,7 @@ class TestUninstallLeftoverCiReleases:
             [{"name": name, "namespace": NAMESPACE, "ci": True} for name in ("first", "second", "third")],
         )
 
-        entrypoint._uninstall_leftover_ci_releases(NAMESPACE)
+        entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID)
 
         assert cluster.uninstalled() == ["first", "second", "third"]
 
@@ -78,7 +79,7 @@ class TestUninstallLeftoverCiReleases:
         """helm uninstall without the namespace looks in the caller's default context and finds nothing."""
         cluster = _cluster(monkeypatch, [{"name": "ci-here", "namespace": NAMESPACE, "ci": True}])
 
-        entrypoint._uninstall_leftover_ci_releases(NAMESPACE)
+        entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID)
 
         assert cluster.commands[1] == ["helm", "uninstall", "ci-here", "--namespace", NAMESPACE]
 
@@ -86,14 +87,38 @@ class TestUninstallLeftoverCiReleases:
         """The caller logs what it cleaned, and a silent cleanup is indistinguishable from a broken one."""
         _cluster(monkeypatch, [{"name": name, "namespace": NAMESPACE, "ci": True} for name in ("a", "b")])
 
-        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE) == ["a", "b"]
+        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID) == ["a", "b"]
 
     def test_does_nothing_when_no_ci_release_is_left(self, monkeypatch):
         """An empty listing must not turn into an uninstall of nothing, which helm treats as an error."""
         cluster = _cluster(monkeypatch, [{"name": "human-here", "namespace": NAMESPACE, "ci": False}])
 
-        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE) == []
+        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID) == []
         assert cluster.uninstalled() == []
+
+    def test_keeps_the_sibling_releases_of_the_run_being_launched(self, monkeypatch):
+        """A split run installs one ci release per component, so cleaning them would tear down its own halves."""
+        run_id = "260101-000000-000"
+        siblings = [f"miles-run-{run_id}", f"miles-run-{run_id}-trainer", f"miles-run-{run_id}-inference"]
+        cluster = _cluster(
+            monkeypatch,
+            [{"name": name, "namespace": NAMESPACE, "ci": True} for name in ("ci-of-another-run", *siblings)],
+        )
+
+        removed = entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=run_id)
+
+        assert removed == ["ci-of-another-run"]
+        assert cluster.uninstalled() == ["ci-of-another-run"]
+
+    def test_recognizes_every_release_this_run_installs_by_the_name_they_share(self):
+        """One component release missed here is one release of this run that its own next launch uninstalls."""
+        run_id = "260101-000000-000"
+
+        assert all(
+            entrypoint._belongs_to_run(release, run_id=run_id)
+            for release in (f"miles-run-{run_id}", f"miles-run-{run_id}-primary", f"miles-run-{run_id}-trainer")
+        )
+        assert not entrypoint._belongs_to_run("miles-run-260101-000000-001-trainer", run_id=run_id)
 
     def test_treats_empty_helm_output_as_nothing_to_clean(self, monkeypatch):
         """helm prints an empty body rather than [] when it has no rows, and json.loads would raise on it."""
@@ -105,4 +130,4 @@ class TestUninstallLeftoverCiReleases:
             ),
         )
 
-        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE) == []
+        assert entrypoint._uninstall_leftover_ci_releases(NAMESPACE, keep_run_id=_OTHER_RUN_ID) == []

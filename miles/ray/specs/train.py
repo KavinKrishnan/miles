@@ -2,13 +2,16 @@ import copy
 import os
 from pathlib import Path
 
-from miles.ray.specs.inference import create_inference_controller_handle
+from miles.ray.specs.static_addrs import trainer_controller_urls
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils.environ import default_fp8_block_scaling_fp32_scales
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.simple import SimpleWorkerProvider
 from miles.utils.workers.worker_spec import (
     MASTER_PORT_NAME,
     PortInfo,
@@ -36,7 +39,6 @@ def spec_trainer_controller_actor(args) -> ServeWorkerSpec:
         role="actor",
         with_ref=args.kl_coef != 0 or args.use_kl_loss,
         with_opd_teacher=args.use_opd and args.opd_type == "megatron",
-        drives_inference=True,
     )
 
 
@@ -45,14 +47,21 @@ def spec_trainer_controller_critic(args) -> ServeWorkerSpec:
         role="critic",
         with_ref=False,
         with_opd_teacher=False,
-        drives_inference=False,
     )
 
 
-def create_trainer_controller_handle(*, capability: BackendCapability, role: str) -> BaseWorkerHandle:
-    worker_name = trainer_controller_worker_name(role)
-    provider = capability.static_worker_provider(pool_id=compute_trainer_controller_pool_id(role))
-    return provider.get_handle(worker_name)
+def create_trainer_controller_handle(args, *, capability: BackendCapability, role: str) -> BaseWorkerHandle:
+    provider = compute_trainer_controller_provider(args, capability=capability, role=role)
+    return provider.get_handle(trainer_controller_worker_name(role))
+
+
+def compute_trainer_controller_provider(args, *, capability: BackendCapability, role: str) -> BaseWorkerProvider:
+    pool_id = compute_trainer_controller_pool_id(role)
+    if (urls := trainer_controller_urls(args, role=role)) is not None:
+        return SimpleWorkerProvider.of_rpc_urls(
+            pool_id=pool_id, urls=urls, worker_class=TRAINER_CONTROLLER_WORKER_CLASS
+        )
+    return capability.static_worker_provider(pool_id=pool_id)
 
 
 def compute_trainer_controller_pool_id(role: str) -> str:
@@ -72,10 +81,10 @@ def _compute_spec_trainer_controller(
     role: str,
     with_ref: bool,
     with_opd_teacher: bool,
-    drives_inference: bool,
 ) -> ServeWorkerSpec:
     return ServeWorkerSpec(
         name=compute_trainer_controller_pool_id(role),
+        deploy_component=DeployComponent.TRAINER,
         port_infos=[],
         env_var=lambda _ctx: {},
         scheduling=SchedulingSpec(
@@ -91,9 +100,6 @@ def _compute_spec_trainer_controller(
             with_opd_teacher=with_opd_teacher,
             cell_provider=ctx.capability.dynamic_worker_provider(pool_ids=[compute_trainer_pool_id(role)]),
             cell_operations=ctx.capability.cell_operations(),
-            inference_controller=(
-                create_inference_controller_handle(capability=ctx.capability) if drives_inference else None
-            ),
         ),
     )
 
@@ -156,6 +162,7 @@ def _compute_spec_trainer(
     return ServeWorkerSpec(
         name=compute_trainer_pool_id(role),
         category=POOL_CATEGORY_TRAINER_ENGINE,
+        deploy_component=DeployComponent.TRAINER,
         port_infos=[PortInfo(name=MASTER_PORT_NAME, static_port=9000, mode="master", allow_dynamic=True)],
         env_var=lambda ctx: compute_trainer_env_vars(args, ctx),
         scheduling=SchedulingSpec(

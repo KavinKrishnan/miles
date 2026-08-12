@@ -4,6 +4,7 @@ import random
 import time
 from pathlib import Path
 
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_provider.kubernetes.helm.naming import CHART_NAME, component_name
 
 ORCHESTRATOR_COMPONENT = "orchestrator"
@@ -20,8 +21,10 @@ _STATE_FILE_GLOB = "orchestrator-*.state"
 
 class RunNames:
     @staticmethod
-    def release(*, run_id: str) -> str:
-        return f"{CHART_NAME}-{run_id}"
+    def release(*, run_id: str, deploy_component: DeployComponent = DeployComponent.ALL) -> str:
+        if deploy_component is DeployComponent.ALL:
+            return f"{CHART_NAME}-{run_id}"
+        return f"{CHART_NAME}-{run_id}-{deploy_component.value}"
 
     @staticmethod
     def service_fqdn(*, name: str, namespace: str) -> str:
