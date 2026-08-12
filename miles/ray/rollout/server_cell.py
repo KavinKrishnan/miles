@@ -162,19 +162,18 @@ class ServerCell:
 
         try:
             await self._tick_when_initializing()
-        except Exception:
-            logger.error(
-                f"Cell {self.meta.cell_id} failed while initializing; disposing it for healing", exc_info=True
-            )
-            await self.dispose()
+        finally:
+            await self._dispose_if_initializing_too_long()
+
+    async def _dispose_if_initializing_too_long(self) -> None:
+        if not isinstance(self._state, StateInitializing) or time.monotonic() < self._initializing_deadline:
             return
 
-        if isinstance(self._state, StateInitializing) and time.monotonic() >= self._initializing_deadline:
-            logger.error(
-                f"Cell {self.meta.cell_id} did not finish initializing within "
-                f"{INITIALIZING_TIMEOUT_SECONDS}s; disposing it for healing"
-            )
-            await self.dispose()
+        logger.error(
+            f"Cell {self.meta.cell_id} did not finish initializing within "
+            f"{INITIALIZING_TIMEOUT_SECONDS}s; disposing it so it can be rebuilt"
+        )
+        await self.dispose()
 
     async def _tick_when_initializing(self) -> None:
         addr_info = self._state.addr_info
