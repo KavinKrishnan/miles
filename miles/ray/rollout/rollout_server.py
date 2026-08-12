@@ -46,13 +46,15 @@ async def create_rollout_servers(
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
             global_health_checker_activeness=global_health_checker_activeness,
-            expected_num_cells=_compute_expected_num_cells(args, model_cfg=model_cfg),
+            expected_num_cells=_compute_expected_num_cells(engine_provider, model_cfg=model_cfg),
         )
 
     return servers
 
 
-def _compute_expected_num_cells(args, *, model_cfg) -> int:
+def _compute_expected_num_cells(engine_provider: BaseWorkerProvider, *, model_cfg) -> int:
+    if (n := engine_provider.expected_num_cells(model_id=model_cfg.name)) is not None:
+        return n
     return sum(
         group_cfg.num_gpus // group_cfg.num_gpus_per_engine
         for group_cfg in model_cfg.server_groups

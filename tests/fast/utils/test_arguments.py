@@ -9,6 +9,8 @@ import pytest
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as validate_sglang_args
 from miles.utils.arguments import (
+    _compute_custom_inference_engine_provider_path,
+    _compute_rollout_external,
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_mini_ft_controller_enable,
@@ -23,7 +25,7 @@ from miles.utils.ft_utils.health_checker import SimpleHealthCheckerConfig
 from miles.utils.function_registry import function_registry
 from miles.utils.run_uuid import RUN_UUID_LENGTH, validate_run_uuid
 
-PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path"]
+PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path", "--custom-inference-engine-provider-path"]
 REQUIRED_ARGS = ["--rollout-batch-size", "64"]
 
 
@@ -72,6 +74,88 @@ class TestAddArgumentsSupport:
         ):
             parser = argparse.ArgumentParser()
             get_miles_extra_args_provider()(parser)
+
+
+class TestAddArgumentsWithoutTheExperimentalRolloutFlag:
+    def test_an_engine_provider_registers_its_own_flags_in_the_default_environment(self, monkeypatch):
+        """External rollout does not need MILES_EXPERIMENTAL_ROLLOUT_REFACTOR, so a provider's
+        add_arguments hook must run when that env var is off, as the docs promise."""
+        monkeypatch.delenv("MILES_EXPERIMENTAL_ROLLOUT_REFACTOR", raising=False)
+        fn = make_function_with_add_arguments()
+        with function_registry.temporary("test:fn", fn), patch.object(
+            sys,
+            "argv",
+            ["test", "--custom-inference-engine-provider-path", "test:fn", "--my-custom-arg", "100"] + REQUIRED_ARGS,
+        ):
+            parser = argparse.ArgumentParser()
+            get_miles_extra_args_provider()(parser)
+            args, _ = parser.parse_known_args()
+
+        assert args.my_custom_arg == 100
+
+
+class TestRolloutExternalDerivation:
+    def test_static_addrs_imply_external_rollout(self):
+        """Giving engine addresses is the whole point of external mode, so no separate flag is needed."""
+        args = SimpleNamespace(
+            rollout_external_engine_addrs=["host1:8000"], custom_inference_engine_provider_path=None
+        )
+
+        assert _compute_rollout_external(args) is True
+
+    def test_a_custom_provider_path_implies_external_rollout(self):
+        """A user-supplied provider means miles must not launch engines of its own."""
+        args = SimpleNamespace(
+            rollout_external_engine_addrs=None, custom_inference_engine_provider_path="my_pkg.my_provider"
+        )
+
+        assert _compute_rollout_external(args) is True
+
+    def test_without_either_arg_rollout_stays_internal(self):
+        """The default run keeps launching its own engines."""
+        args = SimpleNamespace(rollout_external_engine_addrs=None, custom_inference_engine_provider_path=None)
+
+        assert _compute_rollout_external(args) is False
+
+    def test_the_standalone_external_flag_no_longer_exists(self):
+        """--rollout-external was replaced by derivation, so the parser must not define it anymore."""
+        with patch.object(sys, "argv", ["test"] + REQUIRED_ARGS):
+            parser = argparse.ArgumentParser()
+            get_miles_extra_args_provider()(parser)
+
+        option_strings = {s for action in parser._actions for s in action.option_strings}
+        assert "--rollout-external" not in option_strings
+        assert "--rollout-external-engine-addrs" in option_strings
+        assert "--custom-inference-engine-provider-path" in option_strings
+
+
+class TestEngineProviderPathAutofill:
+    def test_a_user_given_path_is_never_overwritten(self):
+        """The custom hook is the escape hatch, so validation must not replace it with a builtin."""
+        args = SimpleNamespace(
+            rollout_external_engine_addrs=["host1:8000"],
+            custom_inference_engine_provider_path="my_pkg.my_provider",
+        )
+
+        assert _compute_custom_inference_engine_provider_path(args) == "my_pkg.my_provider"
+
+    def test_static_addrs_fill_in_the_discovery_provider(self):
+        """Static addresses mean the built-in discovery provider, chosen once in arg validation."""
+        args = SimpleNamespace(
+            rollout_external_engine_addrs=["host1:8000"], custom_inference_engine_provider_path=None
+        )
+
+        assert _compute_custom_inference_engine_provider_path(args) == (
+            "miles.ray.rollout.external_engine_provider.static_inference_engine_provider"
+        )
+
+    def test_an_internal_run_fills_in_the_backend_provider(self):
+        """Without external args the backend keeps announcing the engines it launches itself."""
+        args = SimpleNamespace(rollout_external_engine_addrs=None, custom_inference_engine_provider_path=None)
+
+        assert _compute_custom_inference_engine_provider_path(args) == (
+            "miles.ray.specs.inference.backend_inference_engine_provider"
+        )
 
 
 class TestMaybeApplyDumperOverrides:
