@@ -11,26 +11,15 @@ from miles.utils.misc import SimpleTicker
 
 
 class _RecordingCell:
-    def __init__(
-        self,
-        *,
-        error: Exception | None = None,
-        delay: float = 0.0,
-        cell_id: str = "cell",
-        disposes_itself: bool = False,
-    ):
+    def __init__(self, *, error: Exception | None = None, delay: float = 0.0, cell_id: str = "cell"):
         self.tick_count = 0
         self.finished_count = 0
         self.meta = SimpleNamespace(cell_id=cell_id)
-        self.is_disposed = False
         self._error = error
         self._delay = delay
-        self._disposes_itself = disposes_itself
 
     async def tick(self) -> None:
         self.tick_count += 1
-        if self._disposes_itself:
-            self.is_disposed = True
         if self._error is not None:
             raise self._error
         if self._delay:
@@ -120,39 +109,6 @@ class TestTickCells:
 
         assert broken.tick_count > 1
         assert healthy.tick_count > 1
-
-
-class TestDroppingDisposedCells:
-    async def test_a_cell_that_disposed_itself_is_dropped_from_the_server(self):
-        """Keeping it would hide the gap from reconcile, so the cell would never be rebuilt."""
-        gone = _RecordingCell(cell_id="gone", disposes_itself=True)
-        alive = _RecordingCell(cell_id="alive")
-        srv = _StubServer({"gone": gone, "alive": alive})
-        controller = _make_controller({"default": srv})
-
-        await controller._tick_cells()
-
-        assert set(srv.server_cells) == {"alive"}
-
-    async def test_a_cell_that_disposed_itself_while_raising_is_still_dropped(self):
-        """The deadline path disposes and lets the error propagate, so both must be handled."""
-        gone = _RecordingCell(cell_id="gone", disposes_itself=True, error=RuntimeError("cell exploded"))
-        srv = _StubServer({"gone": gone})
-        controller = _make_controller({"default": srv})
-
-        await controller._tick_cells()
-
-        assert srv.server_cells == {}
-
-    async def test_live_cells_are_never_dropped(self):
-        """Dropping a healthy cell would silently remove a serving engine from the fleet."""
-        alive = _RecordingCell(cell_id="alive")
-        srv = _StubServer({"alive": alive})
-        controller = _make_controller({"default": srv})
-
-        await controller._tick_cells()
-
-        assert set(srv.server_cells) == {"alive"}
 
 
 class TestControllerDisposal:

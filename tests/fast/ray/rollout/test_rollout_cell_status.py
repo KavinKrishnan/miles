@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 
 from tests.fast.ray.rollout.conftest import make_args
@@ -58,6 +59,23 @@ class TestServerCellStatus:
 
         assert status.phase == "Pending"
         assert _conditions(status) == [("Allocated", TriState.TRUE)]
+
+    def test_a_cell_stuck_booting_past_its_deadline_reports_unhealthy(self):
+        """Without a Healthy verdict the mini ft controller reads NotApplicable and never heals it."""
+        cell = _make_cell(StateInitializing(addr_info=_ADDR_INFO))
+        cell._initializing_deadline = time.monotonic() - 1.0
+
+        status = cell.cell_status()
+
+        assert status.phase == "Pending"
+        assert _conditions(status) == [("Allocated", TriState.TRUE), ("Healthy", TriState.FALSE)]
+
+    def test_a_gated_cell_is_never_judged_by_the_startup_deadline(self):
+        """An uninitialized cell has not been asked to boot yet, so its deadline is meaningless."""
+        cell = _make_cell(StateUninitialized())
+        cell._initializing_deadline = time.monotonic() - 1.0
+
+        assert _conditions(cell.cell_status()) == [("Allocated", TriState.TRUE)]
 
     def test_a_cell_holding_stale_weights_is_already_running(self):
         """It answers requests with stale weights, so a crash there is a real failure."""

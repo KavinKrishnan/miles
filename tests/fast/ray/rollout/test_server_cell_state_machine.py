@@ -393,7 +393,7 @@ class TestTick:
 
 
 class TestInitializingDeadline:
-    async def test_a_cell_that_never_becomes_ready_is_disposed(self, cell_env):
+    async def test_a_cell_that_never_becomes_ready_reports_itself_past_its_deadline(self, cell_env):
         """A replacement whose engine died during startup used to stay Initializing forever."""
         cell_env["health"]["ready"] = False
         cell = _make_cell()
@@ -402,9 +402,9 @@ class TestInitializingDeadline:
 
         await cell.tick()
 
-        assert isinstance(cell._state, StateDisposed)
+        assert cell.is_initializing_past_deadline
 
-    async def test_a_cell_within_its_deadline_is_left_alone(self, cell_env):
+    async def test_a_cell_within_its_deadline_is_not_reported(self, cell_env):
         """Engines take minutes to load, so a slow startup must not be torn down."""
         cell_env["health"]["ready"] = False
         cell = _make_cell()
@@ -413,9 +413,10 @@ class TestInitializingDeadline:
         await cell.tick()
 
         assert cell.is_initializing
+        assert not cell.is_initializing_past_deadline
 
-    async def test_a_transient_failure_before_the_deadline_does_not_dispose(self, cell_env, monkeypatch):
-        """Disposing on the first error would throw away the existing retry contract."""
+    async def test_a_transient_failure_before_the_deadline_is_not_reported(self, cell_env):
+        """Reporting on the first error would throw away the existing retry contract."""
 
         class _FlakyRouter(_RecordingRouterApiClient):
             async def add_worker(self, **kwargs):
@@ -428,22 +429,17 @@ class TestInitializingDeadline:
             await cell.tick()
 
         assert cell.is_initializing
+        assert not cell.is_initializing_past_deadline
 
-    async def test_a_cell_still_failing_at_its_deadline_is_disposed(self, cell_env):
-        """A cell that keeps erroring must eventually be handed back for a rebuild."""
-
-        class _FlakyRouter(_RecordingRouterApiClient):
-            async def add_worker(self, **kwargs):
-                raise RuntimeError("router rejected the worker")
-
-        cell = _make_cell(router=_FlakyRouter(), update_weights=False)
+    async def test_a_cell_that_finished_initializing_is_never_reported(self, cell_env):
+        """The deadline only governs startup; a serving cell must not be reclaimed by it."""
+        cell = _make_cell()
         await cell.init()
+        await cell.tick()
         cell._initializing_deadline = time.monotonic() - 1.0
 
-        with pytest.raises(RuntimeError):
-            await cell.tick()
-
-        assert isinstance(cell._state, StateDisposed)
+        assert isinstance(cell._state, StatePendingWeights)
+        assert not cell.is_initializing_past_deadline
 
 
 class TestAddressing:

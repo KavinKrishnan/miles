@@ -87,7 +87,7 @@ class ServerCell:
     def cell_status(self) -> CellStatus:
         match self._state:
             case StateUninitialized() | StateInitializing():
-                return compute_pending_rollout_cell_status()
+                return compute_pending_rollout_cell_status(past_startup_deadline=self.is_initializing_past_deadline)
 
             case StatePendingWeights() | StateServing():
                 return CellStatus(
@@ -129,8 +129,8 @@ class ServerCell:
         return isinstance(self._state, StateServing)
 
     @property
-    def is_disposed(self) -> bool:
-        return isinstance(self._state, StateDisposed)
+    def is_initializing_past_deadline(self) -> bool:
+        return self.is_initializing and time.monotonic() >= self._initializing_deadline
 
     @property
     def addr_info(self) -> CellAddrInfo:
@@ -157,23 +157,8 @@ class ServerCell:
         self._change_state("init", StateUninitialized, StateInitializing(addr_info=addr_info))
 
     async def tick(self) -> None:
-        if not isinstance(self._state, StateInitializing):
-            return
-
-        try:
+        if isinstance(self._state, StateInitializing):
             await self._tick_when_initializing()
-        finally:
-            await self._dispose_if_initializing_too_long()
-
-    async def _dispose_if_initializing_too_long(self) -> None:
-        if not isinstance(self._state, StateInitializing) or time.monotonic() < self._initializing_deadline:
-            return
-
-        logger.error(
-            f"Cell {self.meta.cell_id} did not finish initializing within "
-            f"{INITIALIZING_TIMEOUT_SECONDS}s; disposing it so it can be rebuilt"
-        )
-        await self.dispose()
 
     async def _tick_when_initializing(self) -> None:
         addr_info = self._state.addr_info
@@ -316,8 +301,15 @@ def create_rollout_cell_health_checker(
     return SimpleHealthChecker(name=name, check_fn=_check, get_activeness=get_activeness, config=config)
 
 
-def compute_pending_rollout_cell_status() -> CellStatus:
+def compute_pending_rollout_cell_status(*, past_startup_deadline: bool = False) -> CellStatus:
     return CellStatus(
         phase="Pending",
-        conditions=[CellCondition.allocated(TriState.TRUE)],
+        conditions=[
+            CellCondition.allocated(TriState.TRUE),
+            *(
+                [CellCondition.healthy(TriState.FALSE, reason="StartupDeadlineExceeded")]
+                if past_startup_deadline
+                else []
+            ),
+        ],
     )
