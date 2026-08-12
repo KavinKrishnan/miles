@@ -45,7 +45,9 @@ class UvicornRunRecorder:
 
 
 class TestRunRouter:
-    def test_config_controls_router_construction_and_uvicorn_bind_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_config_controls_router_construction_and_uvicorn_bind_address(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """`run_router` builds the router from the given config and serves its app on the configured host and port."""
         config = MilesRouterConfig(
             host="192.0.2.7",

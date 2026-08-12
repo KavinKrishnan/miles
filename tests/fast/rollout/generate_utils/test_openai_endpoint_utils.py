@@ -114,9 +114,7 @@ class TestOpenAIEndpointTracerCreate:
             return {"session_id": "session-abc"}
 
         monkeypatch.setattr("miles.rollout.generate_utils.openai_endpoint_utils.post", fake_post)
-        monkeypatch.setattr(
-            "miles.rollout.generate_utils.openai_endpoint_utils.random.choice", lambda addrs: addrs[1]
-        )
+        monkeypatch.setattr("miles.rollout.generate_utils.openai_endpoint_utils.random.choice", lambda addrs: addrs[1])
 
         args = SimpleNamespace(
             session_server_addrs=["10.0.0.1:5005", "10.0.0.2:5005"],

@@ -1,12 +1,7 @@
 import pytest
 import ray
 from tests.fast.ray.train import conftest as train_conftest
-from tests.fast.ray.train.conftest import (
-    RecordingHealthChecker,
-    get_raw_actor_handles,
-    make_cell,
-    make_indep_dp_info,
-)
+from tests.fast.ray.train.conftest import RecordingHealthChecker, get_raw_actor_handles, make_cell, make_indep_dp_info
 
 from miles.utils.workers.worker_handle import WorkerUnreachableError
 from miles.utils.workers.worker_spec import HostAndPort

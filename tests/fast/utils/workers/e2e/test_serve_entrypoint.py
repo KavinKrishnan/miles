@@ -190,9 +190,9 @@ class TestWorkerFactoryFailure:
         exit_code = server.wait(EXIT_TIMEOUT_SECONDS)
 
         assert exit_code is not None and exit_code != 0, f"server did not exit:\n{server.logs()}"
-        assert WORKER_FACTORY_ERROR in server.logs(), (
-            f"startup failed before reaching the worker factory:\n{server.logs()}"
-        )
+        assert (
+            WORKER_FACTORY_ERROR in server.logs()
+        ), f"startup failed before reaching the worker factory:\n{server.logs()}"
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", server.port))
 

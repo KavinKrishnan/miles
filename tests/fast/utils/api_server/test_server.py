@@ -386,7 +386,7 @@ class TestStartApiServerRegistration:
 
 
 class _RecordingThread:
-    instances: list["_RecordingThread"] = []
+    instances: list[_RecordingThread] = []
 
     def __init__(self, *, target, daemon: bool) -> None:
         self.target = target

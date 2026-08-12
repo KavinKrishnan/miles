@@ -158,7 +158,9 @@ class TestQueryRemoteWeightInfos:
             isinstance(server_args, p2p_transfer_utils.ServerArgs)
             for server_args in session_id_to_server_args.values()
         )
-        assert {session_id: server_args.model_path for session_id, server_args in session_id_to_server_args.items()} == {
+        assert {
+            session_id: server_args.model_path for session_id, server_args in session_id_to_server_args.items()
+        } == {
             "session-0-0": "/model/0",
             "session-0-1": "/model/0",
             "session-1-0": "/model/1",

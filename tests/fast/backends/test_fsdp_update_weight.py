@@ -404,6 +404,7 @@ class TestUpdateWeightFromDistributed:
         assert all(handle.waited for handle in handles)
         assert [kwargs["names"] for kwargs in engines[1].requests] == [["a", "b"]]
 
+
 def test_fsdp_actor_reconnects_after_rollout_cell_hash_changes(monkeypatch):
     """A changed rollout-cell snapshot reconnects to the replacement engines with their own GPU topology."""
     actor = _make_weight_update_actor(monkeypatch, ci_test=False)

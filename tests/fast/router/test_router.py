@@ -286,12 +286,16 @@ class TestHealthCheck:
 
         assert clock.sleeps == [7.5, 7.5, 7.5]
 
-    def test_only_configured_consecutive_failures_quarantine_worker(self, router_factory, monkeypatch: pytest.MonkeyPatch):
+    def test_only_configured_consecutive_failures_quarantine_worker(
+        self, router_factory, monkeypatch: pytest.MonkeyPatch
+    ):
         """A worker is quarantined only once it fails the configured number of checks in a row, and a success resets the count."""
         worker_url = "http://w1:8000"
         router = router_factory(health_check_interval=0.01, health_check_failure_threshold=4)
         router.worker_request_counts = {worker_url: 0}
-        router._check_worker_health = ScriptedWorkerHealth([False, False, False, True, False, False, False, False]).check
+        router._check_worker_health = ScriptedWorkerHealth(
+            [False, False, False, True, False, False, False, False]
+        ).check
         dead_worker_snapshots: list[set[str]] = []
         clock = FakeSleepClock(stop_after=9, on_sleep=lambda: dead_worker_snapshots.append(set(router.dead_workers)))
         monkeypatch.setattr(router_module.asyncio, "sleep", clock.sleep)

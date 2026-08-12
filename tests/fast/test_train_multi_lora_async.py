@@ -3,15 +3,15 @@ from typing import Any
 
 import pytest
 import ray
-
 import train_multi_lora_async as multi_lora_driver
-from miles.utils.multi_lora import EmptyBatchTimeoutError
 from tests.fast.fixtures.driver_fakes import (
     FakeInferenceController,
     FakeRemoteMethod,
     FakeRolloutExecutor,
     FakeTrainingModel,
 )
+
+from miles.utils.multi_lora import EmptyBatchTimeoutError
 
 _ACTIVE_SNAPSHOT = {"pending": [], "active": ["alpha"], "retiring": [], "cleanup": []}
 _EMPTY_SNAPSHOT = {"pending": [], "active": [], "retiring": [], "cleanup": []}

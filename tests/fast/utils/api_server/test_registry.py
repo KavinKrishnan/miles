@@ -6,7 +6,7 @@ import pytest
 
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 
-from .conftest import MockGateOpeningHandler, MockGatedHandler, MockHandler
+from .conftest import MockGatedHandler, MockGateOpeningHandler, MockHandler
 
 
 class TestListCells:

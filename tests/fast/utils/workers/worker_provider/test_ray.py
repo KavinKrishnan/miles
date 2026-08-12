@@ -146,9 +146,7 @@ class TestRayWorkerProviderGetWorkerInfos:
             "cell-b": _worker_infos("cell-b", count=2),
             "cell-c": _worker_infos("cell-c", count=3),
         }
-        handle = _WorkerInfosManagerHandle(
-            get_worker_infos=_FakeWorkerInfosMethod(infos_by_cell_id=infos_by_cell_id)
-        )
+        handle = _WorkerInfosManagerHandle(get_worker_infos=_FakeWorkerInfosMethod(infos_by_cell_id=infos_by_cell_id))
         provider = RayWorkerProvider(worker_manager_handle=handle, pool_ids=["inference-engine-0-0"])
         monkeypatch.setattr(ray_worker_provider_mod, "ray", _FakeRayModule)
 

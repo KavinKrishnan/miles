@@ -10,8 +10,6 @@ from dataclasses import dataclass
 import pytest
 
 from miles.utils import misc
-from miles.utils.misc import NodeProbeMixin, SimpleTicker, filter_keys, get_free_port
-
 from miles.utils.env_report import ENV_REPORT_PREFIX
 from miles.utils.misc import NodeProbeMixin, SimpleTicker, filter_keys, get_free_port, get_gpu_uuids
 
