@@ -223,9 +223,16 @@
         "expanded": false
        },
        {
-        "group": "Backends",
+        "group": "Model Backends",
         "pages": [
          "advanced/architecture-support"
+        ],
+        "expanded": false
+       },
+       {
+        "group": "Cluster & Deployment",
+        "pages": [
+         "advanced/cluster-backend"
         ],
         "expanded": false
        }
