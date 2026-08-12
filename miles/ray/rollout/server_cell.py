@@ -60,7 +60,6 @@ class ServerCell:
     global_health_checker_activeness: Callable[[], ActiveAndEpoch] = lambda: ActiveAndEpoch(active=True, epoch=0)
     _health_checker: BaseHealthChecker = dataclasses.field(init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
-    _initializing_deadline: float = dataclasses.field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self._health_checker = create_rollout_cell_health_checker(
@@ -130,7 +129,7 @@ class ServerCell:
 
     @property
     def is_initializing_past_deadline(self) -> bool:
-        return self.is_initializing and time.monotonic() >= self._initializing_deadline
+        return self.is_initializing and time.monotonic() - self._state.start_time >= INITIALIZING_TIMEOUT_SECONDS
 
     @property
     def addr_info(self) -> CellAddrInfo:
@@ -153,8 +152,9 @@ class ServerCell:
 
         addr_info = await self._compute_addr_info()
         await activate_launch_gate(gate_url=addr_info.gate_url)
-        self._initializing_deadline = time.monotonic() + INITIALIZING_TIMEOUT_SECONDS
-        self._change_state("init", StateUninitialized, StateInitializing(addr_info=addr_info))
+        self._change_state(
+            "init", StateUninitialized, StateInitializing(addr_info=addr_info, start_time=time.monotonic())
+        )
 
     async def tick(self) -> None:
         if isinstance(self._state, StateInitializing):

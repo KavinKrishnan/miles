@@ -392,13 +392,19 @@ class TestTick:
         assert isinstance(cell._state, StatePendingWeights)
 
 
+def _pretend_started_long_ago(cell: ServerCell) -> None:
+    cell._state = cell._state.model_copy(
+        update=dict(start_time=time.monotonic() - server_cell_module.INITIALIZING_TIMEOUT_SECONDS - 1.0)
+    )
+
+
 class TestInitializingDeadline:
     async def test_a_cell_that_never_becomes_ready_reports_itself_past_its_deadline(self, cell_env):
         """A replacement whose engine died during startup used to stay Initializing forever."""
         cell_env["health"]["ready"] = False
         cell = _make_cell()
         await cell.init()
-        cell._initializing_deadline = time.monotonic() - 1.0
+        _pretend_started_long_ago(cell)
 
         await cell.tick()
 
@@ -436,7 +442,6 @@ class TestInitializingDeadline:
         cell = _make_cell()
         await cell.init()
         await cell.tick()
-        cell._initializing_deadline = time.monotonic() - 1.0
 
         assert isinstance(cell._state, StatePendingWeights)
         assert not cell.is_initializing_past_deadline
