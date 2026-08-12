@@ -67,6 +67,8 @@ def render_cli_argv(
         action = _resolve_action(actions_by_dest, field_name=name, field_to_dest=field_to_dest)
         if value == action.default:
             continue
+        if not _is_renderable(action, value):
+            continue
         argv.extend(_render_action_argv(action, value))
 
     parsed = from_parsed(make_parser().parse_args(argv))
@@ -105,6 +107,14 @@ def _resolve_action(
         f"{field_name!r} cannot be rendered: the parser registers no option for dest {dest!r}. "
         f"Add an entry to field_to_dest, or pass the value through the native passthrough path."
     )
+
+
+def _is_renderable(action: argparse.Action, value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(action, argparse.BooleanOptionalAction):
+        return True
+    return action.nargs != 0 or value == action.const
 
 
 def _render_action_argv(action: argparse.Action, value: object) -> list[str]:
