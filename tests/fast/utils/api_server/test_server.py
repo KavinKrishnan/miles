@@ -369,12 +369,12 @@ class TestStartApiServerRaw:
             running.should_exit = True
 
     def test_a_port_already_taken_fails_the_caller(self) -> None:
-        """A second job silently losing the bind would then poll the first job's cell registry."""
+        """A second job silently losing the port would then poll the first job's cell registry."""
         port = find_available_port(21100)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
             occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             occupied.bind(("0.0.0.0", port))
             occupied.listen()
 
-            with pytest.raises(RuntimeError, match=f"bind port {port}"):
+            with pytest.raises(RuntimeError, match=f"port {port} failed during startup"):
                 server._start_api_server_raw(registry=_CellRegistry([]), port=port)

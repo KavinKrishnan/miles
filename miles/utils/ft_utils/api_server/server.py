@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
-import time
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -14,12 +12,12 @@ from miles.ray.train.group import TrainerController
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.models import Cell, CellList, CellPatch, FaultInjection, K8sStatus, _OkResponse
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
+from miles.utils.thread_utils import start_and_wait_thread
 from miles.utils.workers.ray_worker_manager import RayWorkerManager
 
 logger = logging.getLogger(__name__)
 
 _API_SERVER_STARTUP_TIMEOUT_SECONDS = 30.0
-_API_SERVER_STARTUP_POLL_INTERVAL_SECONDS = 0.05
 
 
 # -------------------------- entrypoint ------------------------------
@@ -62,29 +60,12 @@ def _start_api_server_raw(registry: _CellRegistry, port: int) -> uvicorn.Server:
     app = _create_api_app(registry)
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port))
-    startup_error: list[BaseException] = []
-
-    def _run() -> None:
-        try:
-            server.run()
-        except BaseException as err:  # noqa: BLE001 - re-raised on the caller thread below
-            logger.error("Api server on port %d died", port, exc_info=True)
-            startup_error.append(err)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-
-    deadline = time.monotonic() + _API_SERVER_STARTUP_TIMEOUT_SECONDS
-    while not server.started:
-        if startup_error:
-            raise RuntimeError(f"Api server failed to bind port {port}") from startup_error[0]
-        if not thread.is_alive():
-            raise RuntimeError(f"Api server thread exited before binding port {port}")
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Api server did not bind port {port} within {_API_SERVER_STARTUP_TIMEOUT_SECONDS}s")
-        time.sleep(_API_SERVER_STARTUP_POLL_INTERVAL_SECONDS)
-
-    logger.info("Api server started on port %d", port)
+    start_and_wait_thread(
+        target=server.run,
+        is_ready=lambda: server.started,
+        description=f"Api server on port {port}",
+        timeout_seconds=_API_SERVER_STARTUP_TIMEOUT_SECONDS,
+    )
     return server
 
 
