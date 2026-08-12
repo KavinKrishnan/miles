@@ -9,25 +9,35 @@ from sglang_router.launch_router import RouterArgs
 
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
+from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
+from miles.utils.derived_args import compute_global_batch_size, compute_use_critic
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
 from miles.utils.environ import enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.file_arg_utils import resolve_file_arg
 from miles.utils.ft_utils.health_checker import SimpleHealthCheckerConfig
 from miles.utils.function_registry import load_function
-from miles.utils.hf_config import is_dsa, load_hf_config
+from miles.utils.hf_config import compute_tokenizer_fingerprint, is_dsa, load_hf_config
 from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.lora import is_lora_enabled
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
+from miles.utils.megatron_config import (
+    MegatronConfig,
+    compute_model_arg_overrides,
+    compute_model_args,
+    resolve_megatron_config,
+)
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
 
 logger = logging.getLogger(__name__)
+
+ROLLOUT_TOKENIZER_OWNER = "--hf-checkpoint"
 
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
@@ -185,6 +195,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "with --inference-controller-addrs, because the routers live with the engines they serve."
                 ),
             )
+            parser.set_defaults(trainer_model_id=None)
             parser.add_argument("--actor-num-nodes", type=int, default=1, help="Number of nodes for training actor")
             parser.add_argument(
                 "--actor-num-gpus-per-node", type=int, default=8, help="Number of gpus per node for training actor"
@@ -2738,6 +2749,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             default=None,
             help="Path to the YAML config for custom function arguments, or an inline `base64:<payload>`.",
         )
+        reset_arg(
+            parser,
+            "--megatron-config",
+            type=str,
+            default=None,
+            help=(
+                "Path to a YAML config for multi policy model training (or an inline `base64:<payload>`), "
+                "symmetric to --sglang-config. Format: `megatron: [{name: ..., args: --aaa --bbb}]`. "
+                "Each `name` is the policy model id: it is what a custom rollout function writes into "
+                "Sample.trainer_model_id, and it must match a --sglang-config model with update_weights: true. "
+                "Each `args` string overrides the base CLI arguments for that policy only. Omitting the flag "
+                "is a single policy run named 'default'. Multiple policies require --fully-async and "
+                "train_multi_policy.py."
+            ),
+        )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 
         return parser
@@ -3398,7 +3424,7 @@ def miles_validate_args(args):
             "stay alive; it cannot be combined with --load-debug-rollout-data (debug_train_only)."
         )
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    args.use_critic = compute_use_critic(args)
     if args.use_critic:
         if args.train_backend != "megatron":
             raise ValueError("Shared Actor/Critic PPO requires the Megatron backend")
@@ -3619,15 +3645,7 @@ def miles_validate_args(args):
                 f"save_interval={args.save_interval}). Set --eval-hf-dir for independent snapshots."
             )
 
-    if args.num_steps_per_rollout is not None:
-        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
-        if args.global_batch_size is not None:
-            assert args.global_batch_size == global_batch_size, (
-                f"global_batch_size {args.global_batch_size} is not equal to "
-                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
-                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
-            )
-        args.global_batch_size = global_batch_size
+    args.global_batch_size = compute_global_batch_size(args)
 
     # Multi-LoRA adapters carry their own n_samples_per_prompt; the per-group
     # normalization path already skips std for singleton groups.
@@ -3727,6 +3745,8 @@ def miles_validate_args(args):
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
 
+    validate_multi_policy_args(args)
+
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
         assert (
@@ -3742,6 +3762,68 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     validate_deploy_component(args)
+
+
+def validate_multi_policy_args(args) -> None:
+    config = resolve_megatron_config(args)
+    for model in config.models:
+        assert config.is_multi_policy or not model.extra_args, (
+            f"--megatron-config model {model.name!r} overrides {model.extra_args}, but this run trains a "
+            f"single policy: only train_multi_policy.py applies a per-policy overlay, so pass these on the "
+            f"command line instead of having them silently ignored"
+        )
+        compute_model_arg_overrides(config, model.name)
+
+    if not config.is_multi_policy:
+        return
+
+    assert args.fully_async, (
+        f"multi policy model training {config.model_ids} is only supported for --fully-async: every other "
+        f"rollout mode drives one policy per rollout round"
+    )
+    assert not args.use_critic, "multi policy model training does not support --use-critic"
+    for model_id in config.model_ids:
+        assert not compute_model_args(args, model_id).use_critic, (
+            f"--megatron-config model {model_id!r} derives --use-critic from its own --advantage-estimator, "
+            f"and multi policy model training does not support a critic"
+        )
+    assert args.sglang_config is not None, (
+        "multi policy model training needs --sglang-config to deploy one inference model per policy, "
+        "so that a weight update reaches exactly the engines of its own policy"
+    )
+
+    trainable = [model.name for model in resolve_sglang_config(args).models if model.update_weights]
+    missing = [model_id for model_id in config.model_ids if model_id not in trainable]
+    assert not missing, (
+        f"--megatron-config models {missing} have no matching --sglang-config model with "
+        f"update_weights: true (found {trainable}); the names are the same model id on both sides"
+    )
+
+    _assert_policies_share_a_vocabulary(args, config)
+
+
+def _assert_policies_share_a_vocabulary(args, config: MegatronConfig) -> None:
+    checkpoints = {
+        model_id: compute_model_arg_overrides(config, model_id).get("hf_checkpoint", args.hf_checkpoint)
+        for model_id in config.model_ids
+    }
+    checkpoints[ROLLOUT_TOKENIZER_OWNER] = args.hf_checkpoint
+    if len(set(checkpoints.values())) == 1:
+        return
+
+    vocab_sizes = {model_id: load_hf_config(path).vocab_size for model_id, path in checkpoints.items()}
+    assert len(set(vocab_sizes.values())) == 1, (
+        f"the policies use checkpoints with different vocabularies {vocab_sizes}, but the rollout process "
+        f"holds one tokenizer built from --hf-checkpoint {args.hf_checkpoint}, so every policy would train "
+        f"on prompts encoded for another model"
+    )
+
+    fingerprints = {model_id: compute_tokenizer_fingerprint(path) for model_id, path in checkpoints.items()}
+    assert len(set(fingerprints.values())) == 1, (
+        f"the policies use checkpoints whose tokenizers disagree {fingerprints} even though their vocabularies "
+        f"are the same size, but the rollout process holds one tokenizer built from --hf-checkpoint "
+        f"{args.hf_checkpoint}, so every policy would train on prompts encoded for another model"
+    )
 
 
 def validate_async_off_policy_correction(args) -> None:

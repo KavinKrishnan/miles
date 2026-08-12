@@ -36,16 +36,23 @@ from miles.rollout.fully_async_data_buffer import (
     DefaultDataBuffer,
     Group,
     first_sample,
+    iter_samples,
 )
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.multi_policy import TrainerModelRouter
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.function_registry import load_function
+from miles.utils.megatron_config import resolve_megatron_config
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 NO_PROGRESS_WARN_SECS = 30.0
+
+STAGED_PUT_OVERFLOW_METRIC = "rollout/fully_async/staged_put_overflow_groups"
+
+STAGED_PUT_OVERFLOW_LOG_INTERVAL_GROUPS = 100
 
 
 class FullyAsyncRolloutFn(BaseRolloutFn):
@@ -74,18 +81,24 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._eval_prompt_dataset_cache: dict = {}
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
-        self._output: DataBuffer | None = None
+        self._router = TrainerModelRouter(resolve_megatron_config(input.args).model_ids)
+        self._outputs: dict[str, DataBuffer] = {}
+        self._pending_puts: dict[str, set[asyncio.Task]] = {}
+        self._staged_put_overflow: dict[str, int] = {}
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
             return await self._call_eval(input)
         if self._worker is None:
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or DefaultDataBuffer
-            self._output = buffer_cls(
-                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
-            )
+            self._outputs = {
+                model_id: buffer_cls(DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused))
+                for model_id in self._router.model_ids
+            }
+            self._pending_puts = {model_id: set() for model_id in self._router.model_ids}
+            self._staged_put_overflow = {model_id: 0 for model_id in self._router.model_ids}
             self._worker = asyncio.create_task(self._worker_loop())
-            logger.info("Started fully-async rollout worker")
+            logger.info(f"Started fully-async rollout worker for policy models {self._router.model_ids}")
         return await self._drain(input)
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
@@ -130,16 +143,60 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         active: set[asyncio.Task] = set()
         while True:
             await self._producer_resumed.wait()
-            while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
+            self._reap_pending_puts()
+            while not self._every_queue_backed_up() and self._scheduler.has_capacity(
+                pending_groups=len(active), group_budget=self._max_in_flight_groups()
+            ):
                 active.add(self._submit_one_group())
+
+            if not active:
+                await asyncio.wait(self._all_pending_puts(), return_when=asyncio.FIRST_COMPLETED)
+                continue
+
             done, active = await self._scheduler.wait_for_progress(active)
             for task in done:
-                await self._output.put(task.result())
+                await self._put(task.result())
+
+    async def _put(self, entry: DataBufferInput) -> None:
+        model_id = self._router.resolve_group_model_id(iter_samples(entry.group))
+        if not self._router.is_multi_policy:
+            await self._outputs[model_id].put(entry)
+            return
+
+        staged = self._pending_puts[model_id]
+        if len(staged) >= self._max_in_flight_groups():
+            self._on_staged_put_overflow(model_id, entry)
+            return
+        staged.add(asyncio.create_task(self._outputs[model_id].put(entry)))
+
+    def _on_staged_put_overflow(self, model_id: str, entry: DataBufferInput) -> None:
+        self._staged_put_overflow[model_id] += 1
+        dropped = self._staged_put_overflow[model_id]
+        if dropped % STAGED_PUT_OVERFLOW_LOG_INTERVAL_GROUPS == 1:
+            logger.warning(
+                f"Policy model {model_id!r} already holds {len(self._pending_puts[model_id])} finished groups "
+                f"waiting for its full queue, so this one goes to --async-unused-samples-handler "
+                f"({dropped} groups so far); the other policies keep producing"
+            )
+        self._handle_unused(entry.prompt_group)
+
+    def _reap_pending_puts(self) -> None:
+        for tasks in self._pending_puts.values():
+            for task in [task for task in tasks if task.done()]:
+                tasks.discard(task)
+                task.result()
+
+    def _all_pending_puts(self) -> set[asyncio.Task]:
+        return {task for tasks in self._pending_puts.values() for task in tasks}
+
+    def _every_queue_backed_up(self) -> bool:
+        budget = self._max_in_flight_groups()
+        return all(len(tasks) >= budget for tasks in self._pending_puts.values())
 
     # -------------------------- consumer --------------------------
 
-    async def _next_group(self, current_version: int | None) -> DataBufferInput:
-        queue_get = asyncio.create_task(self._output.get(current_version=current_version))
+    async def _next_group(self, output: DataBuffer, current_version: int | None) -> DataBufferInput:
+        queue_get = asyncio.create_task(output.get(current_version=current_version))
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -163,12 +220,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         args = self.args
         assert args.rollout_global_dataset
 
+        model_id = self._router.resolve_model_id(input.trainer_model_id)
+        output = self._outputs[model_id]
         target_data_size = args.rollout_batch_size
         data: list[Group] = []
         do_print = True
 
         while len(data) < target_data_size:
-            entry = await self._next_group(input.weight_version)
+            entry = await self._next_group(output, input.weight_version)
             assert len(entry.group) == args.n_samples_per_prompt
 
             if do_print:
@@ -192,7 +251,11 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics())
+        metrics = output.get_metrics()
+        if self._router.is_multi_policy:
+            metrics[STAGED_PUT_OVERFLOW_METRIC] = self._staged_put_overflow[model_id]
+
+        return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

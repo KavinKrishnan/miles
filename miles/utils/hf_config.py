@@ -11,12 +11,16 @@ local checkpoint. It supports 2 customizations:
 The default behavior is exactly the same as `AutoConfig.from_pretrained`.
 """
 
+import hashlib
 import importlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+TOKENIZER_FINGERPRINT_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,21 @@ def load_hf_config(
         for key, value in overrides.items():
             setattr(config, key, value)
     return config
+
+
+def compute_tokenizer_fingerprint(checkpoint_path: str) -> str:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+    payload = json.dumps(
+        dict(
+            vocab=sorted(tokenizer.get_vocab().items()),
+            special_tokens=sorted(str(token) for token in tokenizer.all_special_tokens_extended),
+            special_token_ids=sorted(tokenizer.all_special_ids),
+        ),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:TOKENIZER_FINGERPRINT_LENGTH]
 
 
 def is_dsa(hf_config) -> bool:

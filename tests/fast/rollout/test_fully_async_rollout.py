@@ -87,6 +87,7 @@ def make_args(**overrides) -> Namespace:
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
         eval_num_gpus=0,
+        megatron_config=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -307,9 +308,9 @@ async def test_worker_failure_beats_queued_groups(monkeypatch):
     async def boom():
         raise RuntimeError("generation exploded")
 
-    fn._output = make_buffer()[0]
+    fn._outputs = {"default": make_buffer()[0]}
     group = make_group(1)
-    await fn._output.put(data_buffer.DataBufferInput(prompt_group=group, group=group))
+    await fn._outputs["default"].put(data_buffer.DataBufferInput(prompt_group=group, group=group))
     fn._worker = asyncio.create_task(boom())
     await asyncio.sleep(0)
 
@@ -483,7 +484,7 @@ async def test_custom_data_buffer_path_replaces_default(monkeypatch):
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
-    assert type(fn._output) is RecordingBuffer
+    assert type(fn._outputs["default"]) is RecordingBuffer
     assert RecordingBuffer.constructed_with.unused_handler_fn == fn._recycle
     assert len(output.samples) == 2
 
@@ -559,3 +560,137 @@ class TestRolloutFnContract:
         fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
 
         assert fn.constructor_input.data_source is data_source
+
+
+# ── Multi policy: one output queue per trainer_model_id ─────────────
+
+
+def write_megatron_config(tmp_path, *names: str) -> str:
+    import yaml
+
+    path = tmp_path / "megatron.yaml"
+    path.write_text(yaml.dump({"megatron": [{"name": name} for name in names]}))
+    return str(path)
+
+
+def make_tagged_group(group_index: int, trainer_model_id: str | None) -> list[Sample]:
+    group = make_group(group_index)
+    for sample in group:
+        sample.trainer_model_id = trainer_model_id
+    return group
+
+
+class MultiPolicyDataSource(FakeDataSource):
+    """Alternates the trainer_model_id of every group it hands out."""
+
+    def __init__(self, model_ids):
+        super().__init__()
+        self.model_ids = list(model_ids)
+
+    def get_samples(self, num_samples):
+        [group] = super().get_samples(num_samples)
+        model_id = self.model_ids[(self.num_get_calls - 1) % len(self.model_ids)]
+        for sample in group:
+            sample.trainer_model_id = model_id
+        return [group]
+
+
+async def test_multi_policy_drain_serves_only_its_own_policy_queue(monkeypatch, tmp_path):
+    """One queue per trainer_model_id: a drain for 'a' must never return 'b' samples."""
+    args = make_args(rollout_batch_size=2, megatron_config=write_megatron_config(tmp_path, "a", "b"))
+    fn = make_fn(monkeypatch, args, MultiPolicyDataSource(["a", "b"]))
+
+    output_a = await fn(RolloutFnTrainInput(rollout_id=0, trainer_model_id="a"))
+    output_b = await fn(RolloutFnTrainInput(rollout_id=0, trainer_model_id="b"))
+
+    assert sorted(fn._outputs) == ["a", "b"]
+    assert all(sample.trainer_model_id == "a" for group in output_a.samples for sample in group)
+    assert all(sample.trainer_model_id == "b" for group in output_b.samples for sample in group)
+
+
+async def test_multi_policy_drain_without_a_model_id_fails_loudly(monkeypatch, tmp_path):
+    """Falling back to the primary would train one policy on the other's data."""
+    args = make_args(rollout_batch_size=1, megatron_config=write_megatron_config(tmp_path, "a", "b"))
+    fn = make_fn(monkeypatch, args, MultiPolicyDataSource(["a", "b"]))
+
+    with pytest.raises(AssertionError, match="trainer_model_id is required"):
+        await fn(RolloutFnTrainInput(rollout_id=0))
+
+
+async def test_multi_policy_producer_rejects_an_untagged_group(monkeypatch, tmp_path):
+    """The custom rollout function owns the field; a missing id is a bug, caught before enqueueing."""
+    args = make_args(rollout_batch_size=1, megatron_config=write_megatron_config(tmp_path, "a", "b"))
+    data_source = FakeDataSource(scripted=[make_tagged_group(1, None)])
+    fn = make_fn(monkeypatch, args, data_source)
+
+    with pytest.raises(AssertionError, match="trainer_model_id is required"):
+        await fn(RolloutFnTrainInput(rollout_id=0, trainer_model_id="a"))
+
+
+async def test_single_policy_keeps_one_queue_for_untagged_samples(monkeypatch):
+    """No --megatron-config: every sample lands in the only policy's queue with no user change."""
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), FakeDataSource())
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert list(fn._outputs) == ["default"]
+    assert len(output.samples) == 2
+
+
+async def test_a_full_queue_holds_up_only_its_own_policy(monkeypatch, tmp_path):
+    """One producer loop awaiting a full queue used to starve every other policy, and deadlock a save."""
+    args = make_args(
+        rollout_batch_size=1,
+        async_data_buffer_capacity_factor=1.0,
+        megatron_config=write_megatron_config(tmp_path, "a", "b"),
+    )
+    fn = make_fn(monkeypatch, args, MultiPolicyDataSource(["a", "b"]))
+
+    for rollout_id in range(4):
+        output = await asyncio.wait_for(
+            fn(RolloutFnTrainInput(rollout_id=rollout_id, trainer_model_id="b")), timeout=10
+        )
+        assert all(sample.trainer_model_id == "b" for group in output.samples for sample in group)
+        assert len(fn._pending_puts["a"]) <= args.rollout_batch_size
+
+
+async def test_a_starved_policy_stages_a_bounded_number_of_finished_groups(monkeypatch, tmp_path):
+    """Every staged put pins a whole generated group, so an undrained policy would otherwise grow forever."""
+    args = make_args(
+        rollout_batch_size=1,
+        async_data_buffer_capacity_factor=1.0,
+        megatron_config=write_megatron_config(tmp_path, "a", "b"),
+    )
+    fn = make_fn(monkeypatch, args, MultiPolicyDataSource(["a", "b"]))
+
+    staged_per_round: list[int] = []
+    for rollout_id in range(20):
+        await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=rollout_id, trainer_model_id="b")), timeout=10)
+        staged_per_round.append(len(fn._pending_puts["a"]))
+
+    assert max(staged_per_round) <= args.rollout_batch_size
+    assert fn._staged_put_overflow["a"] > 0
+
+
+async def test_a_single_policy_producer_stops_at_the_depth_it_had_before_per_policy_queues(monkeypatch):
+    """With nobody draining, the only policy's producer must stall at one full buffer plus one in-flight
+    window instead of staging finished groups on top of it."""
+    args = make_args(rollout_batch_size=2, async_data_buffer_capacity_factor=1.0)
+    capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
+    data_source = FakeDataSource()
+    fn = make_fn(monkeypatch, args, data_source)
+    fn._outputs = {"default": make_buffer(max_groups=capacity)[0]}
+    fn._pending_puts = {"default": set()}
+    fn._staged_put_overflow = {"default": 0}
+
+    worker = asyncio.create_task(fn._worker_loop())
+    try:
+        await asyncio.sleep(0.05)
+        settled = data_source.num_get_calls
+        assert settled <= capacity + args.rollout_batch_size
+        assert fn._pending_puts["default"] == set()
+
+        await asyncio.sleep(0.05)
+        assert data_source.num_get_calls == settled
+    finally:
+        worker.cancel()

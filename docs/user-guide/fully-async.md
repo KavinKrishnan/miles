@@ -80,6 +80,10 @@ generation. If it is empty, rollout is still the bottleneck and async cannot hid
 | `--num-steps-per-rollout` | Number of optimizer steps per queue drain cycle |
 | `--max-weight-staleness` | When the rollout engine's weight version lags the trainer's by more than this, the worker recycles the stale group instead of feeding it to the loss |
 
+Multi policy runs keep one output queue per policy model, and a finished group is dispatched into the
+queue named by its samples' `trainer_model_id`; see
+[Training Several Policy Models in One Run](/advanced/multi-policy).
+
 The worker caps its output queue at 1000 groups, so if training is slower than
 rollout the producer eventually blocks rather than growing the queue without
 bound. If the queue stays at zero, rollout is the bottleneck — scale rollout capacity

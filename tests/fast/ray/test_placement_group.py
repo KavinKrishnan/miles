@@ -246,7 +246,7 @@ class TestUpdateWeights:
 
         inference_controller = MagicMock()
         inference_controller.start_update_weights = AsyncMock(
-            side_effect=lambda: (order.append("start_update_weights"), info)[1]
+            side_effect=lambda **_kwargs: (order.append("start_update_weights"), info)[1]
         )
         inference_controller.end_update_weights = AsyncMock(
             side_effect=lambda **_kwargs: order.append("end_update_weights")
@@ -275,7 +275,7 @@ class TestUpdateWeights:
         )
 
         fakes.actor_model.update_weights.assert_awaited_once_with(info=fakes.info, rollout_id=3)
-        fakes.rollout_executor.set_weight_version.remote.assert_awaited_once_with(7)
+        fakes.rollout_executor.set_weight_version.remote.assert_awaited_once_with(7, trainer_model_id=None)
 
     async def test_a_trainer_that_skipped_the_broadcast_publishes_nothing(self):
         """--debug-skip-weight-update leaves the engines on their old weights, so the version must not move."""
@@ -471,7 +471,7 @@ class TestMaybeLogInferenceEngineWeightChecksums:
                 _make_args(debug_rollout_only=False), inference_controller=controller, rollout_id=3
             )
 
-        controller.check_weights.assert_awaited_once_with(action="checksum")
+        controller.check_weights.assert_awaited_once_with(action="checksum", model_id=None)
         assert mock_logger.log.call_args.args[1] == dict(
             rollout_id=3, engine_checksums=[{"rank0/w": "e0"}, {"rank0/w": "e1"}]
         )

@@ -1494,3 +1494,225 @@ class TestSecretArgumentsAreClassified:
 
         assert credentials >= {"sglang_api_key", "eval_sglang_api_key", "router_api_key"}
         assert credentials <= _SECRET_ARG_NAMES
+
+
+class TestValidateMultiPolicyArgs:
+    @staticmethod
+    def _write(tmp_path, name: str, data: dict) -> str:
+        import yaml
+
+        path = tmp_path / name
+        path.write_text(yaml.dump(data))
+        return str(path)
+
+    def _args(self, tmp_path, *, model_ids: list[str], fully_async: bool = True, **overrides):
+        megatron_config = self._write(tmp_path, "megatron.yaml", {"megatron": [{"name": n} for n in model_ids]})
+        sglang_config = self._write(
+            tmp_path,
+            "sglang.yaml",
+            {
+                "sglang": [
+                    {"name": n, "update_weights": True, "server_groups": [{"worker_type": "regular", "num_gpus": 1}]}
+                    for n in model_ids
+                ]
+            },
+        )
+        defaults = dict(
+            megatron_config=megatron_config,
+            sglang_config=sglang_config,
+            fully_async=fully_async,
+            use_critic=False,
+            save=None,
+            load=None,
+            hf_checkpoint="/models/base",
+            advantage_estimator="grpo",
+            num_steps_per_rollout=None,
+            global_batch_size=None,
+            rollout_batch_size=8,
+            n_samples_per_prompt=4,
+            rollout_num_gpus=len(model_ids),
+            rollout_num_gpus_per_engine=1,
+            eval_num_gpus=0,
+            prefill_num_servers=None,
+            offload_rollout=False,
+            debug_train_only=False,
+            debug_rollout_only=False,
+            colocate=False,
+            actor_num_nodes=1,
+            actor_num_gpus_per_node=1,
+            critic_num_nodes=0,
+            critic_num_gpus_per_node=0,
+            critic_train_only=False,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_a_single_policy_run_is_always_allowed(self, tmp_path):
+        """Every existing run is a single policy run and must not be gated on anything new."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        validate_multi_policy_args(SimpleNamespace(megatron_config=None, fully_async=False, use_critic=True))
+
+    def test_a_single_policy_config_carrying_per_policy_args_is_refused(self, tmp_path):
+        """Nothing applies an overlay to a single policy run, so those arguments would vanish."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._args(tmp_path, model_ids=["a"])
+        args.megatron_config = self._write(tmp_path, "solo.yaml", {"megatron": [{"name": "a", "args": "--lr 5e-7"}]})
+
+        with pytest.raises(AssertionError, match="silently ignored"):
+            validate_multi_policy_args(args)
+
+    def test_a_per_policy_argument_outside_the_whitelist_is_refused_at_startup(self, tmp_path):
+        """A rhythm argument is read from the base command line, so failing late wastes a job."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._args(tmp_path, model_ids=["a", "b"])
+        args.megatron_config = self._write(
+            tmp_path, "rhythm.yaml", {"megatron": [{"name": "a", "args": "--num-rollout 3"}, {"name": "b"}]}
+        )
+
+        with pytest.raises(AssertionError, match="--num-rollout"):
+            validate_multi_policy_args(args)
+
+    def test_a_policy_whose_engines_are_frozen_by_inference_is_refused(self, tmp_path):
+        """update_weights defaults to False for a model_path of its own, and the run would die mid-training."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._args(tmp_path, model_ids=["a", "b"])
+        args.sglang_config = self._write(
+            tmp_path,
+            "sglang_paths.yaml",
+            {
+                "sglang": [
+                    {"name": "a", "server_groups": [{"worker_type": "regular", "num_gpus": 1}]},
+                    {
+                        "name": "b",
+                        "model_path": "/models/other",
+                        "server_groups": [{"worker_type": "regular", "num_gpus": 1}],
+                    },
+                ]
+            },
+        )
+
+        with pytest.raises(AssertionError, match="no matching --sglang-config model"):
+            validate_multi_policy_args(args)
+
+    def test_a_run_with_a_save_directory_passes_validation(self, tmp_path):
+        """Deriving one checkpoint directory per policy must not collide with itself on the happy path."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        validate_multi_policy_args(self._args(tmp_path, model_ids=["a", "b"], save="/ckpt/run"))
+
+    def test_multi_policy_requires_fully_async(self, tmp_path):
+        """The other rollout modes drive one policy per rollout round; failing late wastes a job."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        with pytest.raises(AssertionError, match="only supported for --fully-async"):
+            validate_multi_policy_args(self._args(tmp_path, model_ids=["a", "b"], fully_async=False))
+
+    def test_multi_policy_accepts_a_matching_sglang_config(self, tmp_path):
+        """The names are one model id shared by the trainer and the inference side."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        validate_multi_policy_args(self._args(tmp_path, model_ids=["a", "b"]))
+
+    def test_a_policy_without_an_inference_model_is_refused(self, tmp_path):
+        """Weights of a policy with no engines of its own would have nowhere to land."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._args(tmp_path, model_ids=["a", "b"])
+        args.sglang_config = self._write(
+            tmp_path,
+            "sglang_partial.yaml",
+            {"sglang": [{"name": "a", "server_groups": [{"worker_type": "regular", "num_gpus": 2}]}]},
+        )
+
+        with pytest.raises(AssertionError, match="no matching --sglang-config model"):
+            validate_multi_policy_args(args)
+
+    def test_multi_policy_without_an_sglang_config_is_refused(self, tmp_path):
+        """One inference model per policy is what makes per-model weight updates possible."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._args(tmp_path, model_ids=["a", "b"])
+        args.sglang_config = None
+
+        with pytest.raises(AssertionError, match="needs --sglang-config"):
+            validate_multi_policy_args(args)
+
+    def _checkpoint_args(self, tmp_path, checkpoints: dict[str, str], **overrides):
+        args = self._args(tmp_path, model_ids=sorted(checkpoints), **overrides)
+        args.megatron_config = self._write(
+            tmp_path,
+            "megatron_checkpoints.yaml",
+            {
+                "megatron": [
+                    {"name": model_id, "args": f"--hf-checkpoint {path}"}
+                    for model_id, path in sorted(checkpoints.items())
+                ]
+            },
+        )
+        return args
+
+    @staticmethod
+    def _stub_tokenizers(monkeypatch, *, vocab_sizes: dict[str, int], fingerprints: dict[str, str]) -> None:
+        monkeypatch.setattr(
+            "miles.utils.arguments.load_hf_config", lambda path: SimpleNamespace(vocab_size=vocab_sizes[path])
+        )
+        monkeypatch.setattr("miles.utils.arguments.compute_tokenizer_fingerprint", lambda path: fingerprints[path])
+
+    def test_policies_sharing_one_tokenizer_pass_the_vocabulary_check(self, tmp_path, monkeypatch):
+        """Two different model sizes of the same family is the use case multi policy exists for."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._checkpoint_args(tmp_path, {"a": "/models/small", "b": "/models/large"})
+        self._stub_tokenizers(
+            monkeypatch,
+            vocab_sizes={"/models/small": 100, "/models/large": 100, "/models/base": 100},
+            fingerprints={"/models/small": "x", "/models/large": "x", "/models/base": "x"},
+        )
+
+        validate_multi_policy_args(args)
+
+    def test_policies_with_different_vocabulary_sizes_are_refused(self, tmp_path, monkeypatch):
+        """One tokenizer encodes every prompt, so a policy on another vocabulary trains on noise."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._checkpoint_args(tmp_path, {"a": "/models/small", "b": "/models/large"})
+        self._stub_tokenizers(
+            monkeypatch,
+            vocab_sizes={"/models/small": 100, "/models/large": 200, "/models/base": 100},
+            fingerprints={"/models/small": "x", "/models/large": "x", "/models/base": "x"},
+        )
+
+        with pytest.raises(AssertionError, match="different vocabularies"):
+            validate_multi_policy_args(args)
+
+    def test_policies_whose_tokenizers_differ_below_the_vocabulary_size_are_refused(self, tmp_path, monkeypatch):
+        """Two tokenizers of the same size can still map the same text to different ids, and nothing errors."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._checkpoint_args(tmp_path, {"a": "/models/small", "b": "/models/large"})
+        self._stub_tokenizers(
+            monkeypatch,
+            vocab_sizes={"/models/small": 100, "/models/large": 100, "/models/base": 100},
+            fingerprints={"/models/small": "x", "/models/large": "y", "/models/base": "x"},
+        )
+
+        with pytest.raises(AssertionError, match="tokenizers disagree"):
+            validate_multi_policy_args(args)
+
+    def test_the_checkpoint_that_builds_the_rollout_tokenizer_is_compared_too(self, tmp_path, monkeypatch):
+        """Every policy overriding --hf-checkpoint used to leave the tokenizer's own checkpoint out of the set."""
+        from miles.utils.arguments import validate_multi_policy_args
+
+        args = self._checkpoint_args(tmp_path, {"a": "/models/other", "b": "/models/other"})
+        self._stub_tokenizers(
+            monkeypatch,
+            vocab_sizes={"/models/other": 200, "/models/base": 100},
+            fingerprints={"/models/other": "x", "/models/base": "x"},
+        )
+
+        with pytest.raises(AssertionError, match="different vocabularies"):
+            validate_multi_policy_args(args)

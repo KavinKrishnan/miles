@@ -10,7 +10,7 @@ import torch.distributed as dist
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import calculate_fwd_flops
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
-from miles.utils.metric_utils import compute_rollout_step
+from miles.utils.metric_utils import compute_metric_namespace, compute_rollout_step, dict_add_prefix
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.types import RolloutBatch
 
@@ -125,10 +125,13 @@ def gather_log_data(
         reduced_log_dict = {f"{metric_name}/{key}": value for key, value in reduced.items()}
         logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
+        namespace = compute_metric_namespace(args)
+        reduced_log_dict = dict_add_prefix(reduced_log_dict, namespace)
         # Calculate step once to avoid duplication
         step = compute_rollout_step(args, rollout_id)
-        reduced_log_dict["rollout/step"] = step
-        tracking.log(args, reduced_log_dict, step_key="rollout/step")
+        step_key = f"{namespace}rollout/step"
+        reduced_log_dict[step_key] = step
+        tracking.log(args, reduced_log_dict, step_key=step_key)
 
         return reduced_log_dict
     else:
@@ -434,10 +437,12 @@ def log_cpu_memory(rollout_id: int, args: Namespace, label: str) -> None:
     cpu_mem_gb = psutil.virtual_memory().used / 1e9
     step = compute_rollout_step(args, rollout_id)
     logger.info(f"[CPU memory] {label}: {cpu_mem_gb:.2f} GB (rollout_id={rollout_id}, step={step})")
+    namespace = compute_metric_namespace(args)
+    step_key = f"{namespace}rollout/step"
     tracking.log(
         args,
-        {f"perf/cpu_memory_{label}_gb": cpu_mem_gb, "rollout/step": step},
-        step_key="rollout/step",
+        {f"{namespace}perf/cpu_memory_{label}_gb": cpu_mem_gb, step_key: step},
+        step_key=step_key,
     )
 
 
@@ -537,13 +542,16 @@ def log_train_step(
         for key, val in extra_metrics.items():
             log_dict_out[f"train/{role_tag}{key}"] = val
 
-    log_dict_out["train/step"] = accumulated_step_id
+    namespace = compute_metric_namespace(args)
+    log_dict_out = dict_add_prefix(log_dict_out, namespace)
+    step_key = f"{namespace}train/step"
+    log_dict_out[step_key] = accumulated_step_id
 
     if should_log is None:
         should_log = dist.get_rank() == 0
 
     if should_log:
-        tracking.log(args, log_dict_out, step_key="train/step")
+        tracking.log(args, log_dict_out, step_key=step_key)
         logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict_out}")
 
     return log_dict_out

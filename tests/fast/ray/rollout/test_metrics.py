@@ -157,6 +157,38 @@ class TestTitoMismatchMetrics:
         assert "rollout/tito_session_mismatch_rate/assistant_text" not in logged
 
 
+class TestMultiPolicyMetricNamespace:
+    @staticmethod
+    def _log(monkeypatch, trainer_model_id: str | None) -> tuple[dict, list[str]]:
+        args = make_args(advantage_estimator="ppo", ci_test=False, log_passrate=False)
+        logged: dict = {}
+        step_keys: list[str] = []
+        monkeypatch.setattr(
+            "miles.ray.rollout.metrics.tracking.log",
+            lambda _args, metrics, step_key, **_kwargs: (logged.update(metrics), step_keys.append(step_key)),
+        )
+
+        log_rollout_data(3, args, make_samples_grouped(1, 4), None, 1.0, trainer_model_id=trainer_model_id)
+
+        return logged, step_keys
+
+    def test_a_single_policy_run_logs_the_keys_it_always_logged(self, monkeypatch):
+        """Every existing dashboard and tracking query is written against these names."""
+        logged, step_keys = self._log(monkeypatch, None)
+
+        assert step_keys == ["rollout/step"]
+        assert any(key.startswith("rollout/response_len/") for key in logged)
+
+    def test_a_multi_policy_run_gives_every_policy_its_own_keys_and_step(self, monkeypatch):
+        """Two policies at different rhythms would otherwise overwrite one curve and walk its step backwards."""
+        logged, step_keys = self._log(monkeypatch, "policy_b")
+
+        assert step_keys == ["policy_b/rollout/step"]
+        assert logged["policy_b/rollout/step"] == 3
+        assert any(key.startswith("policy_b/rollout/response_len/") for key in logged)
+        assert not any(key.startswith("rollout/") for key in logged)
+
+
 class TestComputePassrateFromSamples:
     def test_returns_empty_when_group_size_is_one(self):
         args = make_args(n_samples_per_prompt=1)

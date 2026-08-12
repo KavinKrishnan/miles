@@ -135,15 +135,20 @@ class InferenceController(NodeProbeMixin):
 
     # -------------------------- engine management -----------------------------
 
+    @lock_exempt
+    async def updatable_model_ids(self) -> list[str]:
+        return [model_id for model_id, srv in self.servers.items() if srv.update_weights]
+
     @acquires_lock
-    async def start_update_weights(self) -> UpdatableEngines:
+    async def start_update_weights(self, model_id: str | None = None) -> UpdatableEngines:
         """Return engines eligible for weight updates."""
         await self._health_monitoring_pause()
         await self._ensure_cells_ready()
 
-        srv = self._get_updatable_server()
+        srv = self._get_updatable_server(model_id)
         if not srv:
             return UpdatableEngines(
+                model_id=model_id,
                 rollout_engines=[],
                 engine_gpu_counts=[],
                 engine_gpu_offsets=[],
@@ -151,6 +156,7 @@ class InferenceController(NodeProbeMixin):
             )
 
         return UpdatableEngines(
+            model_id=srv.model_name,
             rollout_engines=srv.api_clients,
             engine_gpu_counts=srv.engine_gpu_counts,
             engine_gpu_offsets=srv.engine_gpu_offsets,
@@ -194,7 +200,13 @@ class InferenceController(NodeProbeMixin):
                 await asyncio.sleep(CELLS_READY_POLL_INTERVAL_SECONDS)
 
     @requires_lock
-    def _get_updatable_server(self) -> RolloutServer | None:
+    def _get_updatable_server(self, model_id: str | None = None) -> RolloutServer | None:
+        if model_id is not None:
+            srv = self.servers.get(model_id)
+            assert srv is not None, f"No server for model_id {model_id!r}, known ids: {sorted(self.servers)}"
+            assert srv.update_weights, f"Server for model_id {model_id!r} is frozen (update_weights=False)"
+            return srv
+
         updatable = [srv for srv in self.servers.values() if srv.update_weights]
         match updatable:
             case []:
@@ -204,7 +216,7 @@ class InferenceController(NodeProbeMixin):
             case _:
                 raise ValueError(
                     f"Multiple servers have update_weights=True: {[srv.model_name for srv in updatable]}. "
-                    f"Only one updatable server is supported."
+                    f"Pass model_id to update exactly one of them."
                 )
 
     # -------------------------- eval fleet -----------------------------
@@ -231,10 +243,15 @@ class InferenceController(NodeProbeMixin):
 
     @with_lock
     async def check_weights(
-        self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        selector: str = "all",
+        skip_list: list[str] | None = None,
+        model_id: str | None = None,
     ) -> list[Any]:
         # Only the updatable model is re-synced; a frozen model would always mismatch.
-        srv = self._get_updatable_server()
+        srv = self._get_updatable_server(model_id)
         if srv is None:
             return []
         return await srv.check_weights(

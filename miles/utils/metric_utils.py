@@ -8,6 +8,10 @@ def dict_add_prefix(d: dict[str, Any], prefix: str) -> dict[str, Any]:
     return {f"{prefix}{k}": v for k, v in d.items()}
 
 
+def compute_metric_namespace(args) -> str:
+    return "" if args.trainer_model_id is None else f"{args.trainer_model_id}/"
+
+
 def compute_pass_rate(
     flat_rewards: list[float],
     group_size: int,

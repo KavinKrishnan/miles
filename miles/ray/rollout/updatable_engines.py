@@ -9,3 +9,4 @@ class UpdatableEngines:
     engine_gpu_counts: list[int]
     engine_gpu_offsets: list[int]
     snapshot_cell_id_to_hashes: dict[str, str]
+    model_id: str | None = None

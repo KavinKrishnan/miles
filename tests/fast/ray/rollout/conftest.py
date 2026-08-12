@@ -150,6 +150,7 @@ def make_args(**overrides: Any) -> Namespace:
         save_debug_event_data=None,
         load=None,
         save=None,
+        megatron_config=None,
         # CI
         ci_test=False,
         # dumper (sglang debug dumper integration)

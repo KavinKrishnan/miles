@@ -124,6 +124,8 @@ class Sample:
     # Per-sample routing key for the router's consistent_hashing policy (sent as X-SMG-Routing-Key)
     routing_key: str | None = None
 
+    trainer_model_id: str | None = None
+
     non_generation_time: float = 0.0  # time spent in non-generation steps
 
     @dataclass

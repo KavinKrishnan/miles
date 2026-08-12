@@ -21,9 +21,9 @@ _TOOLING_DIRS = (
 
 TRAIN_ONLY_SUBCOMMAND = "train"
 
-ORCHESTRATION_SCRIPTS = ("train.py", "train_async.py", "train_multi_lora_async.py")
+ORCHESTRATION_SCRIPTS = ("train.py", "train_async.py", "train_multi_lora_async.py", "train_multi_policy.py")
 
-BACKEND_CAPABILITY_FN = "create_backend_capability"
+WORKER_MANAGER_FN = "launch_worker_manager"
 
 UPPER_LAYER_MODULES = (
     "kubernetes",
@@ -53,6 +53,7 @@ UPPER_LAYER_EXEMPTIONS = {
     "train.py": "orchestration script: its first lines are the driver process's composition root",
     "train_async.py": "orchestration script: its first lines are the driver process's composition root",
     "train_multi_lora_async.py": "orchestration script: its first lines are the driver process's composition root",
+    "train_multi_policy.py": "orchestration script: its first lines are the driver process's composition root",
     "miles/utils/workers/worker_provider": "the infrastructure that owns every provider implementation",
     "miles/utils/workers/serving/serve_inner.py": "the composition root of a served worker process",
     "miles/utils/workers/ray_worker_manager.py": "the composition root of a worker process an actor wraps",
@@ -137,9 +138,9 @@ class TestLayering:
         assert reaching != [], f"{exemption} no longer reaches upwards: {UPPER_LAYER_EXEMPTIONS[exemption]}"
 
     @pytest.mark.parametrize("script", ORCHESTRATION_SCRIPTS)
-    def test_an_orchestration_script_forks_the_backend_exactly_once(self, script: str):
-        """The whole run hangs off one factory, and a second one would observe the same workers twice."""
-        assert len(_calls_of(REPO_ROOT / script, BACKEND_CAPABILITY_FN)) == 1
+    def test_an_orchestration_script_launches_the_workers_exactly_once(self, script: str):
+        """The whole run hangs off one launch, and a second one would observe the same workers twice."""
+        assert len(_calls_of(REPO_ROOT / script, WORKER_MANAGER_FN)) == 1
 
 
 class TestImportDirection:

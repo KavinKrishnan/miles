@@ -553,6 +553,59 @@ class TestUpdatableModelSelection:
             await controller.start_update_weights()
 
     @pytest.mark.asyncio
+    async def test_a_named_model_selects_exactly_its_own_engines(self):
+        """Multi policy training updates one policy at a time; the other policies must not move."""
+        a = _RecordingServer(model_name="a", update_weights=True)
+        a.api_clients = ["a-client"]
+        b = _RecordingServer(model_name="b", update_weights=True)
+        b.api_clients = ["b-client"]
+        controller = self._controller(a, b)
+
+        updatable = await controller.start_update_weights(model_id="b")
+
+        assert updatable.model_id == "b"
+        assert updatable.rollout_engines == ["b-client"]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_model_id_is_refused(self):
+        """Silently updating nothing would leave the engines serving stale weights forever."""
+        controller = self._controller(_RecordingServer(model_name="a", update_weights=True))
+
+        with pytest.raises(AssertionError, match="No server for model_id"):
+            await controller.start_update_weights(model_id="b")
+
+    @pytest.mark.asyncio
+    async def test_a_frozen_model_is_refused_by_name(self):
+        """Pushing training weights into a reference model destroys the KL baseline."""
+        controller = self._controller(
+            _RecordingServer(model_name="a", update_weights=True),
+            _RecordingServer(model_name="ref", update_weights=False),
+        )
+
+        with pytest.raises(AssertionError, match="is frozen"):
+            await controller.start_update_weights(model_id="ref")
+
+    @pytest.mark.asyncio
+    async def test_the_updatable_model_ids_are_reported(self):
+        """The orchestration script iterates these to drive one weight update per policy."""
+        controller = self._controller(
+            _RecordingServer(model_name="a", update_weights=True),
+            _RecordingServer(model_name="ref", update_weights=False),
+            _RecordingServer(model_name="b", update_weights=True),
+        )
+
+        assert sorted(await controller.updatable_model_ids()) == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_the_weight_checker_targets_the_named_model(self):
+        """A per-policy checksum must compare the policy's own engines, not another policy's."""
+        a = _RecordingServer(model_name="a", update_weights=True)
+        b = _RecordingServer(model_name="b", update_weights=True)
+
+        assert await self._controller(a, b).check_weights(action="checksum", model_id="b") == ["b"]
+        assert a.calls == []
+
+    @pytest.mark.asyncio
     async def test_the_weight_checker_skips_the_frozen_models(self):
         """reset_tensors on a model nobody will rewrite scrambles it for the rest of the run."""
         actor = _RecordingServer(model_name="actor", update_weights=True)

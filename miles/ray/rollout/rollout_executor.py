@@ -33,6 +33,7 @@ from miles.utils.function_registry import load_function
 from miles.utils.hf_config import is_complete_hf_export
 from miles.utils.http_utils import init_http_client
 from miles.utils.logging_utils import configure_logger
+from miles.utils.megatron_config import resolve_megatron_config
 from miles.utils.metric_checker import MetricChecker
 from miles.utils.misc import NodeProbeMixin
 from miles.utils.multi_lora import EmptyBatchTimeoutError
@@ -65,6 +66,9 @@ class RolloutExecutor(NodeProbeMixin):
         self.args = args
         # set by the training actor after each weight update
         self.weight_version: int | None = None
+        self._weight_versions: dict[str | None, int] = {}
+        self._rollout_ids: dict[str | None, int] = {}
+        self._multi_policy = resolve_megatron_config(args).is_multi_policy
         self._router_providers = router_providers
         self._session_server_provider = session_server_provider
         self._inference_controller_provider = inference_controller_provider
@@ -107,7 +111,7 @@ class RolloutExecutor(NodeProbeMixin):
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
-        self.rollout_id = -1
+        self.newest_rollout_id = -1
         self._eval_lock = asyncio.Lock()
         self._eval_fleet: EvalFleetSession | None = None
 
@@ -126,19 +130,25 @@ class RolloutExecutor(NodeProbeMixin):
 
     # -------------------------- data generation -----------------------------
 
-    async def get(self, rollout_id: int) -> dict[str, Any]:
+    async def get(self, rollout_id: int, trainer_model_id: str | None = None) -> dict[str, Any]:
         start_time = time.time()
-        self.rollout_id = rollout_id
+        metric_model_id = trainer_model_id if self._multi_policy else None
+        self._rollout_ids[trainer_model_id] = rollout_id
+        self.newest_rollout_id = max(self._rollout_ids.values())
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
-        with timer("rollout"):
+        with timer("rollout" if metric_model_id is None else f"rollout/{metric_model_id}"):
             try:
-                data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
+                data, metadata, metrics = await self._get_rollout_data(
+                    rollout_id=rollout_id, trainer_model_id=trainer_model_id
+                )
             except EmptyBatchTimeoutError as e:
                 logger.warning(f"Rollout {rollout_id} produced no trainable group before the empty-wait timeout: {e}")
                 return dict(sample_indices=None, data_ref=None, empty_batch_timeout=True)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
-        log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        log_rollout_data(
+            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=metric_model_id
+        )
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -213,7 +223,7 @@ class RolloutExecutor(NodeProbeMixin):
             data = result.data
             save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
             extra_metrics = dict(result.metrics or {})
-            extra_metrics["eval/lag_steps"] = max(self.rollout_id - rollout_id, 0)
+            extra_metrics["eval/lag_steps"] = max(self.newest_rollout_id - rollout_id, 0)
             extra_metrics["eval/duration_seconds"] = time.time() - start_time
             if export_time_seconds is not None:
                 extra_metrics["eval/export_time_seconds"] = export_time_seconds
@@ -224,7 +234,7 @@ class RolloutExecutor(NodeProbeMixin):
     def report_eval_skip(self, rollout_id: int, reason: str) -> None:
         log_eval_skip(rollout_id, self.args, reason)
 
-    async def _get_rollout_data(self, rollout_id):
+    async def _get_rollout_data(self, rollout_id, trainer_model_id: str | None = None):
         if self.args.load_debug_rollout_data:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metrics = None
@@ -233,7 +243,11 @@ class RolloutExecutor(NodeProbeMixin):
                 data = await asyncio.to_thread(
                     call_rollout_function,
                     self.generate_rollout,
-                    RolloutFnTrainInput(rollout_id=rollout_id, weight_version=self.weight_version),
+                    RolloutFnTrainInput(
+                        rollout_id=rollout_id,
+                        weight_version=self._weight_versions.get(trainer_model_id, self.weight_version),
+                        trainer_model_id=trainer_model_id,
+                    ),
                 )
             else:
                 data = await asyncio.to_thread(
@@ -275,13 +289,17 @@ class RolloutExecutor(NodeProbeMixin):
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
-    def set_weight_version(self, weight_version: int) -> None:
+    def set_weight_version(self, weight_version: int, trainer_model_id: str | None = None) -> None:
         # warning instead of assert when use indep_dp ft
-        if self.weight_version is not None and weight_version < self.weight_version:
-            message = f"Engine weight version went backwards: {self.weight_version} -> {weight_version}"
+        if (previous := self._weight_versions.get(trainer_model_id)) is not None and weight_version < previous:
+            message = (
+                f"Engine weight version of model {trainer_model_id} went backwards: {previous} -> {weight_version}"
+            )
             assert self.args.indep_dp, message
             logger.warning(message)
-        self.weight_version = weight_version
+        self._weight_versions[trainer_model_id] = weight_version
+        if trainer_model_id is None:
+            self.weight_version = weight_version
 
     def set_train_parallel_config(self, config: dict[str, Any]) -> None:
         self.train_parallel_config = config
