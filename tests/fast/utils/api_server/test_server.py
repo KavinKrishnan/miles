@@ -385,39 +385,29 @@ class TestStartApiServerRegistration:
         assert ports == [19137]
 
 
-class _RecordingThread:
-    instances: list[_RecordingThread] = []
-
-    def __init__(self, *, target, daemon: bool) -> None:
-        self.target = target
-        self.daemon = daemon
-        self.started = False
-        _RecordingThread.instances.append(self)
-
-    def start(self) -> None:
-        self.started = True
-        self.target()
-
-
 class TestStartApiServerRaw:
     def test_uvicorn_serves_the_registry_app_on_a_daemon_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A foreground server blocks the training driver, and a loopback bind hides it from the FT controller."""
-        _RecordingThread.instances.clear()
-        run_calls: list[dict[str, object]] = []
+        serving_threads: list[threading.Thread] = []
+        start_and_wait_thread = server._start_and_wait_thread
 
-        monkeypatch.setattr(server, "threading", SimpleNamespace(Thread=_RecordingThread))
-        monkeypatch.setattr(
-            server, "uvicorn", SimpleNamespace(run=lambda app, **kwargs: run_calls.append({"app": app, **kwargs}))
-        )
+        def _record_thread(**kwargs) -> threading.Thread:
+            thread = start_and_wait_thread(**kwargs)
+            serving_threads.append(thread)
+            return thread
 
-        server._start_api_server_raw(registry=_CellRegistry([]), port=19137)
+        monkeypatch.setattr(server, "_start_and_wait_thread", _record_thread)
+        port = find_available_port(21200)
 
-        [thread] = _RecordingThread.instances
-        assert thread.daemon is True
-        assert thread.started
-        [run_call] = run_calls
-        assert isinstance(run_call["app"], FastAPI)
-        assert {key: value for key, value in run_call.items() if key != "app"} == {"host": "0.0.0.0", "port": 19137}
+        running = server._start_api_server_raw(registry=_CellRegistry([]), port=port)
+
+        try:
+            [thread] = serving_threads
+            assert thread.daemon is True
+            assert isinstance(running.config.app, FastAPI)
+            assert (running.config.host, running.config.port) == ("0.0.0.0", port)
+        finally:
+            running.should_exit = True
 
     def test_a_bound_port_serves_and_can_be_reached(self) -> None:
         """The happy path must still return once uvicorn is actually accepting connections."""
