@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
+from miles.ray.specs.trainer_identity import compute_trainer_roles
 from miles.utils.workers.worker_provider.simple import parse_host_and_port
 from miles.utils.workers.worker_spec import HostAndPort
 
@@ -12,10 +13,10 @@ INFERENCE_ROUTER_ADDRS_FLAG = "--inference-router-addrs"
 def trainer_controller_urls(args, *, role: str) -> list[str] | None:
     if (entries := args.trainer_controller_addrs) is None:
         return None
-    urls = _group_by_key(entries, keys=["actor", "critic"], flag=TRAINER_CONTROLLER_ADDRS_FLAG).get(role, [])
+    urls = _group_by_key(entries, keys=compute_trainer_roles(args), flag=TRAINER_CONTROLLER_ADDRS_FLAG).get(role, [])
     assert len(urls) == 1, (
-        f"{TRAINER_CONTROLLER_ADDRS_FLAG} names {len(urls)} controllers for role {role!r}, but a run drives "
-        f"exactly one of them"
+        f"{TRAINER_CONTROLLER_ADDRS_FLAG} names {len(urls)} controllers for trainer {role!r}, but every trainer "
+        f"of a run is driven through exactly one of them"
     )
     return urls
 
@@ -24,8 +25,8 @@ def inference_controller_urls(args) -> list[str] | None:
     if (entries := args.inference_controller_addrs) is None:
         return None
     assert len(entries) == 1, (
-        f"{INFERENCE_CONTROLLER_ADDRS_FLAG} names {len(entries)} controllers, but a run drives exactly one of them "
-        f"until a composite controller fans out over several inference deployments"
+        f"{INFERENCE_CONTROLLER_ADDRS_FLAG} names {len(entries)} controllers, but a run drives exactly one of them, "
+        f"and every other engine deployment registers its cells into that one"
     )
     return list(entries)
 

@@ -77,8 +77,7 @@ async def _make_executor(args):
 
 def _make_test_args(**overrides):
     return make_args(
-        sglang_router_ip="127.0.0.1",
-        sglang_router_port=30000,
+        sglang_model_routers={"default": ("127.0.0.1", 30000)},
         use_wandb=False,
         use_tensorboard=False,
         use_mlflow=False,

@@ -62,6 +62,9 @@ def make_args(**overrides: Any) -> Namespace:
         trainer_controller_addrs=None,
         inference_controller_addrs=None,
         inference_router_addrs=None,
+        expected_registration_reporters=0,
+        registration_token=None,
+        registration_external_hosts=None,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,
@@ -86,8 +89,6 @@ def make_args(**overrides: Any) -> Namespace:
         use_critic=False,
         critic_train_only=False,
         # sglang router
-        sglang_router_ip=None,
-        sglang_router_port=None,
         sglang_router_policy=None,
         sglang_router_request_timeout_secs=600,
         sglang_dp_size=1,

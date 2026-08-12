@@ -6,7 +6,12 @@ import pytest
 import torch
 from tests.fast.ray.rollout.conftest import make_args, make_sample, make_samples_grouped
 
-from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
+from miles.ray.rollout.debug_data import (
+    RolloutDataInjectionUtil,
+    compute_debug_data_stem,
+    load_debug_rollout_data,
+    save_debug_rollout_data,
+)
 
 # ----------------------------- save / load round-trip -----------------------------
 
@@ -92,6 +97,36 @@ class TestRoundTrip:
         monkeypatch.setattr(torch, "save", lambda *a, **kw: called.append((a, kw)))
         save_debug_rollout_data(args, [make_sample()], rollout_id=0, evaluation=False)
         assert called == []
+
+
+class TestComputeDebugDataStem:
+    def test_a_train_rollout_is_named_by_its_id_alone(self):
+        """The single-policy filenames are a recorded contract every replay tool reads."""
+        assert compute_debug_data_stem(rollout_id=7, evaluation=False, trainer_model_id=None) == "7"
+
+    def test_an_eval_rollout_keeps_its_prefix(self):
+        """Eval and train data of one rollout id must not overwrite each other."""
+        assert compute_debug_data_stem(rollout_id=7, evaluation=True, trainer_model_id=None) == "eval_7"
+
+    def test_a_multi_policy_rollout_is_named_by_the_policy_it_trained(self):
+        """Every policy generates its own data for the same rollout id, so one file per policy."""
+        assert compute_debug_data_stem(rollout_id=7, evaluation=False, trainer_model_id="critic") == "7_critic"
+        assert compute_debug_data_stem(rollout_id=7, evaluation=True, trainer_model_id="critic") == "eval_7_critic"
+
+
+class TestPerPolicyFiles:
+    def test_two_policies_of_one_rollout_land_in_separate_files(self, tmp_path: Path):
+        """Sharing a filename would leave only the policy that saved last."""
+        path_template = str(tmp_path / "rollout_{rollout_id}.pt")
+        args_save = make_args(save_debug_rollout_data=path_template)
+
+        for model_id in ("actor", "critic"):
+            save_debug_rollout_data(
+                args_save, [make_sample()], rollout_id=2, evaluation=False, trainer_model_id=model_id
+            )
+
+        assert (tmp_path / "rollout_2_actor.pt").exists()
+        assert (tmp_path / "rollout_2_critic.pt").exists()
 
 
 # ----------------------------- subsample -----------------------------

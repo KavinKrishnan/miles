@@ -19,7 +19,7 @@ from miles.utils.external_utils.command_utils.common import (
 from miles.utils.external_utils.model_args_utils import shell_safe_model_args
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.typer_utils import dataclass_from_env
-from miles.utils.workers.types import ClusterBackend, DeployComponent
+from miles.utils.workers.types import ClusterBackend, DeployComponent, DeploySelector
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +33,16 @@ class ExecuteTrainConfig:
     output_dir: str = "/root/shared_data"
     cluster_backend: ClusterBackend = ClusterBackend.RAY
     deploy_component: DeployComponent = DeployComponent.ALL
+    deploy_instance: str | None = None
     run_id: str = field(default_factory=create_run_id)
     namespace: str = ""
     helm_values: tuple[str, ...] = ()
     force: bool = False
     ci_run: bool = False
+
+    @property
+    def deploy_selector(self) -> DeploySelector:
+        return DeploySelector(component=self.deploy_component, instance=self.deploy_instance)
 
     def create_backend(self) -> BaseCommandBackend:
         match self.cluster_backend:
@@ -106,9 +111,9 @@ class BaseCommandBackend(ABC):
         assert train_backend_fsdp == (megatron_model_type is None)
         _assert_train_args_name_no_other_backend(train_argv, cluster_backend=self.config.cluster_backend.value)
         _assert_train_args_name_no_other_deploy_component(
-            train_argv, deploy_component=self.config.deploy_component.value
+            train_argv, deploy_component=self.config.deploy_selector.value
         )
-        train_args = _with_deploy_component(train_args, train_argv, deploy_component=self.config.deploy_component)
+        train_args = _with_deploy_component(train_args, train_argv, selector=self.config.deploy_selector)
 
         self._execute_train_inner(
             ExecuteTrainRequest(
@@ -211,10 +216,10 @@ class BaseCommandBackend(ABC):
     ) -> list[str | None]: ...
 
 
-def _with_deploy_component(train_args: str, train_argv: list[str], *, deploy_component: DeployComponent) -> str:
-    if deploy_component is DeployComponent.ALL or ArgvManipulator.declares(train_argv, DEPLOY_COMPONENT_FLAG):
+def _with_deploy_component(train_args: str, train_argv: list[str], *, selector: DeploySelector) -> str:
+    if selector.component is DeployComponent.ALL or ArgvManipulator.declares(train_argv, DEPLOY_COMPONENT_FLAG):
         return train_args
-    return f"{train_args} {DEPLOY_COMPONENT_FLAG} {deploy_component.value}"
+    return f"{train_args} {DEPLOY_COMPONENT_FLAG} {selector.value}"
 
 
 def _assert_train_args_name_no_other_deploy_component(train_argv: list[str], *, deploy_component: str) -> None:

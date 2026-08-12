@@ -1,16 +1,17 @@
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleet, EvalFleetInfo, EvalFleetPin
-from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
+from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers, dispose_uncommitted_cell
 from miles.ray.rollout.router_manager import resolve_router_addrs
-from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
+from miles.ray.rollout.server_cell import ServerCell, compute_server_cell_meta_from_info
 from miles.ray.rollout.updatable_engines import UpdatableEngines
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.context_lock import (
@@ -26,8 +27,15 @@ from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.ft_utils.health_checker import ActivenessTracker
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import NodeProbeMixin, SimpleTicker
+from miles.utils.workers.registration.models import (
+    SNAPSHOT_STALENESS_WARNING_SECONDS,
+    RegistrationAck,
+    RegistrationSnapshot,
+)
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
+from miles.utils.workers.worker_spec import HostAndPort
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +43,13 @@ TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
+
+
+@dataclass
+class _CellReconcileSlot:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    revision: int = 0
 
 
 @enforce_lock_discipline
@@ -46,16 +61,20 @@ class InferenceController(NodeProbeMixin):
         *,
         engine_provider: BaseWorkerProvider,
         router_providers: Sequence[BaseWorkerProvider],
+        registration_provider: RegistrationWorkerProvider | None = None,
     ) -> None:
         self.args = args
         self._engine_provider = engine_provider
         self._router_providers = router_providers
+        self._registration_provider = registration_provider
         self.context_lock = ContextLock("InferenceController")
         self.servers: dict[str, RolloutServer] = {}
         self._eval_fleet: EvalFleet | None = None
+        self._router_addrs: dict[str, HostAndPort] = {}
         self._watcher_disposers: list[StopWatchFn] = []
         self._health_checker_activeness = ActivenessTracker(active=True)
         self._ticker: SimpleTicker | None = None
+        self._cell_reconcile_slots: dict[str, _CellReconcileSlot] = {}
 
     @lock_exempt
     async def init(self) -> None:
@@ -76,6 +95,7 @@ class InferenceController(NodeProbeMixin):
         if self.args.eval_num_gpus > 0:
             self._eval_fleet = EvalFleet(self.args, srv=self.servers["eval"])
 
+        self._router_addrs = router_addrs
         self._watcher_disposers.append(await self._engine_provider.watch_cells(self._reconcile))
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
@@ -94,16 +114,20 @@ class InferenceController(NodeProbeMixin):
     async def prepare_eval(self) -> None:
         await self._health_monitoring_resume()
 
-    @with_lock
+    @lock_exempt
     async def dispose(self) -> None:
         if (ticker := self._ticker) is not None:
             self._ticker = None
-            await ticker.dispose()
+            await _stop_while_tearing_down(ticker.dispose(), what="the cell ticker of this run")
 
         for disposer in self._watcher_disposers:
-            await disposer()
+            await _stop_while_tearing_down(disposer(), what="a cell watch of this run")
         self._watcher_disposers = []
 
+        await self._dispose_servers()
+
+    @with_lock
+    async def _dispose_servers(self) -> None:
         for srv in self.servers.values():
             await srv.dispose()
 
@@ -134,6 +158,18 @@ class InferenceController(NodeProbeMixin):
             await srv.onload(tags)
 
     # -------------------------- engine management -----------------------------
+
+    @lock_exempt
+    async def get_router_urls(self) -> dict[str, str]:
+        return {model_id: addr.addr for model_id, addr in self._router_addrs.items()}
+
+    @lock_exempt
+    async def apply_registration_snapshot(self, snapshot: RegistrationSnapshot) -> RegistrationAck:
+        assert self._registration_provider is not None, (
+            f"reporter {snapshot.reporter_id} registered engines with this run, which does not expect any; pass "
+            f"--expected-registration-reporters to the deployment that runs the inference controller"
+        )
+        return await self._registration_provider.apply_snapshot(snapshot)
 
     @lock_exempt
     async def updatable_model_ids(self) -> list[str]:
@@ -271,31 +307,90 @@ class InferenceController(NodeProbeMixin):
             if isinstance(result, BaseException):
                 logger.error(f"Ticking cell {cell.meta.cell_id} failed", exc_info=result)
 
+        for srv in list(self.servers.values()):
+            srv.remove_unreachable_cells()
+        self._log_stale_reporters()
+
+    @requires_lock
+    def _log_stale_reporters(self) -> None:
+        if (provider := self._registration_provider) is None:
+            return
+        for reporter_id in provider.reporter_ids():
+            if (seconds := provider.seconds_since_last_snapshot(reporter_id)) < SNAPSHOT_STALENESS_WARNING_SECONDS:
+                continue
+            logger.warning(
+                f"Reporter {reporter_id} last registered its cells {seconds:.0f}s ago, longer than "
+                f"{SNAPSHOT_STALENESS_WARNING_SECONDS:.0f}s. Staleness never removes a cell, so the "
+                f"{len(provider.cell_ids())} registered cells stay in this run until its own probe finds them dead"
+            )
+
     # -------------------------- reconcile -----------------------------
 
-    @with_lock
+    @lock_exempt
     async def _reconcile(self, cell_id: str, observed: CellInfo | None) -> None:
-        actual_srv: RolloutServer | None = None
-        actual_cell: ServerCell | None = None
-        for srv in self.servers.values():
-            if (c := srv.server_cells.get(cell_id)) is not None:
-                actual_srv, actual_cell = srv, c
-                break
+        slot = self._cell_reconcile_slots.setdefault(cell_id, _CellReconcileSlot())
+        slot.users += 1
+        slot.revision += 1
+        revision = slot.revision
+        try:
+            async with slot.lock:
+                await self._reconcile_one_observation(cell_id=cell_id, observed=observed, revision=revision)
+        finally:
+            slot.users -= 1
+            if slot.users == 0:
+                self._cell_reconcile_slots.pop(cell_id, None)
 
+    @lock_exempt
+    async def _reconcile_one_observation(self, *, cell_id: str, observed: CellInfo | None, revision: int) -> None:
         async def _add(_cell_id: str, observed_info: CellInfo) -> None:
-            observed_cell_meta = _compute_server_cell_meta_from_info(observed_info)
-            await self.servers[observed_cell_meta.model_id].add_cell(observed_cell_meta)
-
-        async def _remove(remove_cell_id: str) -> None:
-            await actual_srv.remove_cell(remove_cell_id)
+            await self._bring_up_cell(cell_id=_cell_id, observed=observed_info, revision=revision)
 
         await apply_cell_observation(
             cell_id=cell_id,
             observed=observed,
-            actual_workers_hash=actual_cell.meta.workers_hash if actual_cell is not None else None,
+            actual_workers_hash=await self._workers_hash_of_cell(cell_id),
             add=_add,
-            remove=_remove,
+            remove=self._remove_cell,
         )
+
+    @lock_exempt
+    async def _bring_up_cell(self, *, cell_id: str, observed: CellInfo, revision: int) -> None:
+        cell_meta = compute_server_cell_meta_from_info(observed)
+        srv = self.servers[cell_meta.model_id]
+        cell = await srv.bring_up_cell(cell_meta)
+
+        if self._cell_reconcile_slots[cell_id].revision != revision:
+            logger.warning(
+                f"Cell {cell_id} of {srv.model_name} was observed again while it was being brought up, so this "
+                f"bring-up is dropped and the newer observation alone decides what this run holds"
+            )
+            await dispose_uncommitted_cell(cell)
+            return
+
+        if not await self._commit_cell(srv=srv, cell=cell):
+            logger.warning(
+                f"Cell {cell_id} of {srv.model_name} finished starting up after its server was disposed, so it is "
+                f"torn down again instead of joining a run that is already over"
+            )
+            await dispose_uncommitted_cell(cell)
+
+    @with_lock
+    async def _commit_cell(self, *, srv: RolloutServer, cell: ServerCell) -> bool:
+        return srv.commit_cell(cell)
+
+    @with_lock
+    async def _workers_hash_of_cell(self, cell_id: str) -> str | None:
+        for srv in self.servers.values():
+            if (cell := srv.server_cells.get(cell_id)) is not None:
+                return cell.meta.workers_hash
+        return None
+
+    @with_lock
+    async def _remove_cell(self, cell_id: str) -> None:
+        for srv in self.servers.values():
+            if cell_id in srv.server_cells:
+                await srv.remove_cell(cell_id)
+                return
 
     # -------------------------- utils -----------------------------
 
@@ -308,17 +403,8 @@ class InferenceController(NodeProbeMixin):
         self._health_checker_activeness.bump_active(True)
 
 
-# TODO may move and generalize later
-def _compute_server_cell_meta_from_info(info: CellInfo) -> ServerCellMetadata:
-    return ServerCellMetadata(
-        model_id=info.meta["model_id"],
-        worker_type=info.meta["worker_type"],
-        cell_id=info.cell_id,
-        num_gpus_per_engine=info.meta["num_gpus_per_engine"],
-        gpu_offset=info.meta["gpu_offset"],
-        sglang_api_key=info.meta["sglang_api_key"],
-        worker_name=info.worker_names[0],
-        needs_offload=info.meta["needs_offload"],
-        update_weights=info.meta["update_weights"],
-        workers_hash=info.workers_hash,
-    )
+async def _stop_while_tearing_down(step: Awaitable[None], *, what: str) -> None:
+    try:
+        await step
+    except Exception:
+        logger.error(f"Stopping {what} failed, so this run tears the rest of it down anyway", exc_info=True)

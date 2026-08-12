@@ -100,16 +100,24 @@ def load_debug_rollout_data(args, rollout_id: int) -> tuple[list[Sample], dict]:
     return data, metadata
 
 
-def save_debug_rollout_data(args, data, rollout_id, evaluation: bool, metadata: dict | None = None) -> None:
+def compute_debug_data_stem(*, rollout_id, evaluation: bool, trainer_model_id: str | None) -> str:
+    prefix = "eval_" if evaluation else ""
+    suffix = "" if trainer_model_id is None else f"_{trainer_model_id}"
+    return f"{prefix}{rollout_id}{suffix}"
+
+
+def save_debug_rollout_data(
+    args, data, rollout_id, evaluation: bool, metadata: dict | None = None, trainer_model_id: str | None = None
+) -> None:
     # TODO to be refactored (originally Buffer._set_data)
     if (path_template := args.save_debug_rollout_data) is not None:
-        path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
+        stem = compute_debug_data_stem(rollout_id=rollout_id, evaluation=evaluation, trainer_model_id=trainer_model_id)
+        path = Path(path_template.format(rollout_id=stem))
         logger.info(f"Save debug rollout data to {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
 
         samples = [sample for info in data.values() for sample in info["samples"]] if evaluation else list(data)
         save_debug_trajectory_data(args, samples, rollout_id, evaluation)
-        stem = ("eval_" if evaluation else "") + str(rollout_id)
         save_dashboard_columns(samples, path.parent.parent / "dashboard_columns" / f"rollout_{stem}.parquet")
 
         # TODO may improve the format

@@ -309,8 +309,7 @@ def _router_args(ip="10.0.0.5", port=3333, use_miles_dashboard=True):
         "Args",
         (),
         {
-            "sglang_router_ip": ip,
-            "sglang_router_port": port,
+            "sglang_model_routers": None if ip is None else {"default": (ip, port)},
             "use_miles_router": False,
             "use_miles_dashboard": use_miles_dashboard,
         },

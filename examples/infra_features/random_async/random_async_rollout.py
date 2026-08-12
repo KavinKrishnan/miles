@@ -38,6 +38,7 @@ import pybase64
 from random_async_sglang_metrics import SGLangMetricsReporter, record_agent_request
 
 from miles.rollout.data_source import DataSource
+from miles.rollout.router_addressing import compute_router_url
 from miles.utils.async_utils import run
 from miles.utils.http_utils import post as http_post
 from miles.utils.types import Sample, WeightVersionsPerCall
@@ -89,7 +90,7 @@ async def _generate_one_random_sample(args, sample: Sample) -> Sample:
     accumulated_response: list[int] = []
     accumulated_log_probs: list[float] = []
     accumulated_loss_mask: list[int] = []
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_router_url(args, endpoint="/generate")
     start_time = time.time()
     turns = 0
     perfect_cacheable_prefix_len = 0
@@ -284,7 +285,7 @@ class AsyncRandomRolloutWorker:
         self._group_index = 0
 
         if args.sglang_enable_metrics:
-            router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+            router_url = compute_router_url(args)
             self.metrics_reporter = SGLangMetricsReporter(
                 router_url=router_url,
                 prefill_num_gpus=args.rollout_num_gpus_per_engine,

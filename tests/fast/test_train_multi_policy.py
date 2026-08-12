@@ -35,7 +35,7 @@ def _make_args(**overrides) -> Namespace:
     return Namespace(**defaults)
 
 
-def _make_run(args, *, model_ids: tuple[str, ...], trainers: dict[str, AsyncMock]) -> _MultiPolicyRun:
+def _make_run(args, *, model_ids: tuple[str, ...], trainers: AsyncMock) -> _MultiPolicyRun:
     config = _make_config(*model_ids)
     return _MultiPolicyRun(
         args,
@@ -43,9 +43,8 @@ def _make_run(args, *, model_ids: tuple[str, ...], trainers: dict[str, AsyncMock
         inference_controller=AsyncMock(),
         rollout_executor=AsyncMock(),
         num_rollout_per_epoch=None,
-        policies=[
-            _Policy(model_id=model_id, trainer=trainers[model_id], start_rollout_id=0) for model_id in model_ids
-        ],
+        trainers=trainers,
+        policies=[_Policy(model_id=model_id, start_rollout_id=0) for model_id in model_ids],
     )
 
 
@@ -63,13 +62,15 @@ class TestMultiPolicyRun:
             "update_weights",
             AsyncMock(side_effect=lambda *a, model_id, rollout_id=None, **kw: updated.append((model_id, rollout_id))),
         )
-        trainers = {"a": AsyncMock(), "b": AsyncMock()}
+        trainers = AsyncMock()
         run = _make_run(_make_args(), model_ids=("a", "b"), trainers=trainers)
 
         await run.run()
 
         drained = [call.kwargs["trainer_model_id"] for call in run.rollout_executor.get.await_args_list]
+        trained = [call.kwargs["model_id"] for call in trainers.train.await_args_list]
         assert sorted(drained) == ["a", "a", "b", "b"]
+        assert sorted(trained) == ["a", "a", "b", "b"]
         assert sorted(updated) == [("a", 0), ("a", 1), ("b", 0), ("b", 1)]
 
     async def test_two_policies_are_inside_the_executor_at_the_same_time(self, monkeypatch):
@@ -86,8 +87,7 @@ class TestMultiPolicyRun:
             await asyncio.wait_for(both_arrived.wait(), timeout=5)
             return dict(data_ref=None)
 
-        trainers = {"a": AsyncMock(), "b": AsyncMock()}
-        run = _make_run(_make_args(num_rollout=1), model_ids=("a", "b"), trainers=trainers)
+        run = _make_run(_make_args(num_rollout=1), model_ids=("a", "b"), trainers=AsyncMock())
         run.rollout_executor.get = _get
 
         await asyncio.wait_for(run.run(), timeout=5)
@@ -99,14 +99,15 @@ class TestMultiPolicyRun:
         monkeypatch.setattr(train_multi_policy, "update_weights", AsyncMock())
         rounds_of_b = 0
 
-        async def _train(rollout_id: int, rollout_data_ref, **kwargs) -> None:
+        async def _train(rollout_id: int, rollout_data_ref, *, model_id: str) -> None:
             nonlocal rounds_of_b
+            if model_id == "a":
+                raise RuntimeError("trainer a died")
             rounds_of_b += 1
             await asyncio.sleep(0.05)
 
-        trainers = {"a": AsyncMock(), "b": AsyncMock()}
-        trainers["a"].train = AsyncMock(side_effect=RuntimeError("trainer a died"))
-        trainers["b"].train = _train
+        trainers = AsyncMock()
+        trainers.train = _train
         run = _make_run(_make_args(num_rollout=100), model_ids=("a", "b"), trainers=trainers)
 
         with pytest.raises(RuntimeError, match="trainer a died"):
@@ -119,11 +120,12 @@ class TestMultiPolicyRun:
         monkeypatch.setattr(train_multi_policy, "update_weights", AsyncMock())
         args = _make_args(num_rollout=1, save=str(tmp_path), save_interval=1)
 
-        async def _slow_train(rollout_id: int, rollout_data_ref) -> None:
-            await asyncio.sleep(0.05)
+        async def _train(rollout_id: int, rollout_data_ref, *, model_id: str) -> None:
+            if model_id == "b":
+                await asyncio.sleep(0.05)
 
-        trainers = {"a": AsyncMock(), "b": AsyncMock()}
-        trainers["b"].train = _slow_train
+        trainers = AsyncMock()
+        trainers.train = _train
         run = _make_run(args, model_ids=("a", "b"), trainers=trainers)
 
         await asyncio.wait_for(run.run(), timeout=5)
@@ -135,9 +137,8 @@ class TestMultiPolicyRun:
     async def test_a_run_without_a_save_directory_never_reaches_the_sidecar(self, monkeypatch):
         """--save-trigger-sentinel without --save used to build a Path(None) and crash the primary."""
         monkeypatch.setattr(train_multi_policy, "update_weights", AsyncMock())
-        trainers = {"a": AsyncMock(), "b": AsyncMock()}
         args = _make_args(num_rollout=1, save=None, save_interval=1, save_trigger_sentinel="/nonexistent/sentinel")
-        run = _make_run(args, model_ids=("a", "b"), trainers=trainers)
+        run = _make_run(args, model_ids=("a", "b"), trainers=AsyncMock())
         run.coordinator.begin_save = AsyncMock(side_effect=AssertionError("must not start a save"))
 
         await asyncio.wait_for(run.run(), timeout=5)
@@ -232,10 +233,7 @@ class TestDefinePolicyMetricGroups:
 class TestAssertConsistentRestore:
     @staticmethod
     def _policies(**start_rollout_ids: int) -> list[_Policy]:
-        return [
-            _Policy(model_id=model_id, trainer=AsyncMock(), start_rollout_id=value)
-            for model_id, value in start_rollout_ids.items()
-        ]
+        return [_Policy(model_id=model_id, start_rollout_id=value) for model_id, value in start_rollout_ids.items()]
 
     def test_a_fresh_run_needs_no_record(self, tmp_path):
         """Nothing was ever saved, so there is nothing to be consistent with."""

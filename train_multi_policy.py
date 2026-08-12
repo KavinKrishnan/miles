@@ -6,7 +6,8 @@ from pathlib import Path
 
 from miles.ray.deployment import run_deployment
 from miles.ray.placement_group import create_rollout_components, maybe_start_api_server, update_weights
-from miles.ray.specs.train import create_trainer_controller_handle
+from miles.ray.specs.train import create_composite_trainer_controller
+from miles.ray.train.composite import CompositeTrainerController
 from miles.ray.train.multi_policy import (
     MultiPolicyCheckpointState,
     MultiPolicySaveCoordinator,
@@ -33,7 +34,6 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _Policy:
     model_id: str
-    trainer: BaseWorkerHandle
     start_rollout_id: int
 
 
@@ -43,14 +43,16 @@ class _MultiPolicyRun:
         args,
         *,
         config: MegatronConfig,
-        inference_controller: BaseWorkerHandle,
+        inference_controller,
         rollout_executor: BaseWorkerHandle,
         num_rollout_per_epoch: int | None,
+        trainers: CompositeTrainerController,
         policies: list[_Policy],
     ) -> None:
         self.args = args
         self.config = config
         self.inference_controller = inference_controller
+        self.trainers = trainers
         self.rollout_executor = rollout_executor
         self.num_rollout_per_epoch = num_rollout_per_epoch
         self.policies = policies
@@ -78,7 +80,7 @@ class _MultiPolicyRun:
             for rollout_id in range(policy.start_rollout_id, args.num_rollout):
                 await self.inference_controller.prepare_rollout(rollout_id)
                 rollout_data_ref = await self.rollout_executor.get(rollout_id, trainer_model_id=policy.model_id)
-                await policy.trainer.train(rollout_id, rollout_data_ref)
+                await self.trainers.train(rollout_id, rollout_data_ref, model_id=policy.model_id)
                 remove_rollout_data_refs(args, rollout_data_ref)
                 last_rollout_id = rollout_id
 
@@ -87,7 +89,7 @@ class _MultiPolicyRun:
                 if (rollout_id + 1) % args.update_weights_interval == 0:
                     await update_weights(
                         args,
-                        actor_model=policy.trainer,
+                        actor_model=self.trainers,
                         rollout_executor=self.rollout_executor,
                         inference_controller=self.inference_controller,
                         rollout_id=rollout_id,
@@ -113,7 +115,9 @@ class _MultiPolicyRun:
             if await self.coordinator.maybe_park(
                 policy.model_id,
                 rollout_id,
-                lambda force_sync: policy.trainer.save_model(rollout_id, force_sync=force_sync),
+                lambda force_sync: self.trainers.save_model(
+                    rollout_id, force_sync=force_sync, model_id=policy.model_id
+                ),
             ):
                 self.saved_rollout_ids[policy.model_id] = rollout_id
             return
@@ -126,7 +130,7 @@ class _MultiPolicyRun:
 
         force_sync = external_save or rollout_id == args.num_rollout - 1
         async with self.coordinator.saving(rollout_id, force_sync=force_sync):
-            await policy.trainer.save_model(rollout_id, force_sync=force_sync)
+            await self.trainers.save_model(rollout_id, force_sync=force_sync, model_id=policy.model_id)
             self.saved_rollout_ids[policy.model_id] = rollout_id
             await self.rollout_executor.save(rollout_id)
             self._write_checkpoint_state()
@@ -141,7 +145,7 @@ class _MultiPolicyRun:
             return
 
         async with self.coordinator.final_saving(policy.model_id, last_rollout_id):
-            await policy.trainer.save_model(last_rollout_id, force_sync=True)
+            await self.trainers.save_model(last_rollout_id, force_sync=True, model_id=policy.model_id)
             self.saved_rollout_ids[policy.model_id] = last_rollout_id
             if policy.model_id == self.config.primary_model_id:
                 await self.rollout_executor.save(last_rollout_id)
@@ -186,23 +190,26 @@ async def train_multi_policy(args) -> None:
     object_store.init_instance(args, contribute_segment=False)
 
     inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
-    policies: list[_Policy] = []
+    trainers = create_composite_trainer_controller(args, capability=get_backend_capability(args))
 
     try:
-        policies = await _create_policies(args, config=config)
+        await trainers.wait_ready()
+        policies = await _create_policies(args, config=config, trainers=trainers)
         primary = policies[0]
 
         _assert_consistent_restore(args, config=config, policies=policies)
-        await rollout_executor.set_train_parallel_config(await primary.trainer.get_train_parallel_config())
+        await rollout_executor.set_train_parallel_config(
+            await trainers.get_train_parallel_config(model_id=primary.model_id)
+        )
         await rollout_executor.load(primary.start_rollout_id - 1)
 
-        maybe_start_api_server(args, actor_model=primary.trainer, inference_controller=inference_controller)
+        maybe_start_api_server(args, actor_model=trainers, inference_controller=inference_controller)
         maybe_start_mini_ft_controller(args)
 
         for policy in policies:
             await update_weights(
                 args,
-                actor_model=policy.trainer,
+                actor_model=trainers,
                 rollout_executor=rollout_executor,
                 inference_controller=inference_controller,
                 model_id=policy.model_id,
@@ -214,14 +221,14 @@ async def train_multi_policy(args) -> None:
             inference_controller=inference_controller,
             rollout_executor=rollout_executor,
             num_rollout_per_epoch=num_rollout_per_epoch,
+            trainers=trainers,
             policies=policies,
         )
         await run.run()
     finally:
         await rollout_executor.dispose()
         await inference_controller.dispose()
-        for policy in policies:
-            await policy.trainer.dispose()
+        await trainers.dispose()
 
 
 def define_policy_metric_groups(config: MegatronConfig) -> None:
@@ -232,22 +239,14 @@ def define_policy_metric_groups(config: MegatronConfig) -> None:
         define_step_key_metric_group(prefix=f"{model_id}/train", step_key=f"{model_id}/train/step")
 
 
-async def _create_policies(args, *, config: MegatronConfig) -> list[_Policy]:
-    capability = get_backend_capability(args)
+async def _create_policies(args, *, config: MegatronConfig, trainers: CompositeTrainerController) -> list[_Policy]:
     ans: list[_Policy] = []
     for model_id in config.model_ids:
         model_args = compute_model_args(args, model_id)
-        trainer = create_trainer_controller_handle(
-            args, capability=capability, role=compute_trainer_role(config, model_id)
-        )
-        start_rollout_ids = await trainer.init(model_args)
+        start_rollout_ids = await trainers.init(model_args, model_id=model_id)
         assert len(set(start_rollout_ids)) == 1, f"model {model_id} restored to {start_rollout_ids}"
-        ans.append(_Policy(model_id=model_id, trainer=trainer, start_rollout_id=start_rollout_ids[0]))
+        ans.append(_Policy(model_id=model_id, start_rollout_id=start_rollout_ids[0]))
     return ans
-
-
-def compute_trainer_role(config: MegatronConfig, model_id: str) -> str:
-    return model_id if config.is_multi_policy else "actor"
 
 
 def _assert_consistent_restore(args, *, config: MegatronConfig, policies: list[_Policy]) -> None:

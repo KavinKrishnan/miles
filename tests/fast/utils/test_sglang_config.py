@@ -35,6 +35,12 @@ def _resolve(path: str, *, rollout_num_gpus: int, hf_checkpoint: str = "/path/to
         critic_num_gpus_per_node=0,
         use_critic=False,
         critic_train_only=False,
+        deploy_component="all",
+        megatron_config=None,
+        kl_coef=0,
+        use_kl_loss=False,
+        use_opd=False,
+        opd_type="megatron",
     )
     return resolve_sglang_config(args)
 
@@ -98,8 +104,6 @@ class TestGetModelUrl:
         from miles.rollout.sglang_rollout import get_model_url
 
         args = Namespace(
-            sglang_router_ip="10.0.0.1",
-            sglang_router_port=3000,
             sglang_model_routers={
                 "actor": ("10.0.0.1", 3000),
                 "ref": ("10.0.0.1", 3001),
@@ -116,23 +120,9 @@ class TestGetModelUrl:
         from miles.rollout.sglang_rollout import get_model_url
 
         args = Namespace(
-            sglang_router_ip="10.0.0.1",
-            sglang_router_port=3000,
             sglang_model_routers={"actor": ("10.0.0.1", 3000)},
         )
         assert get_model_url(args, "unknown") == "http://10.0.0.1:3000/generate"
-
-    def test_get_model_url_no_routers(self):
-        """get_model_url should work when sglang_model_routers is not set."""
-        from argparse import Namespace
-
-        from miles.rollout.sglang_rollout import get_model_url
-
-        args = Namespace(
-            sglang_router_ip="10.0.0.1",
-            sglang_router_port=3000,
-        )
-        assert get_model_url(args, "anything") == "http://10.0.0.1:3000/generate"
 
 
 if __name__ == "__main__":

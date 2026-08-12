@@ -8,6 +8,7 @@ from tests.fast.ray.train import conftest as train_conftest
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_provider
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
+from miles.ray.specs.trainer_identity import DEFAULT_TRAINER_ROLE
 from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
 from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
@@ -61,7 +62,7 @@ def _make_controller(
     train_conftest.fake_worker_manager.num_cells = num_cells
     train_conftest.fake_worker_manager.actor_count_per_cell = actor_count_per_cell
     group = TrainerController(
-        role="actor",
+        role=DEFAULT_TRAINER_ROLE,
         with_ref=False,
         cell_provider=make_provider(),
         cell_operations=MagicMock(),
@@ -122,15 +123,15 @@ async def _make_alive_controller(*, num_cells: int = 3, **kwargs) -> TrainerCont
 
 
 class TestIndepDPStore:
-    def test_a_multi_cell_pool_gets_one_quorum_store_from_its_controller(self):
+    async def test_a_multi_cell_pool_gets_one_quorum_store_from_its_controller(self):
         """The store must be minted once, where every cell can be told the same address."""
-        group = _make_controller(num_cells=3)
+        group = await _make_alive_controller(num_cells=3)
 
         assert group._indep_dp_store_addr == train_conftest.FAKE_STORE_ADDR
 
-    def test_a_single_cell_pool_needs_no_quorum_store(self):
+    async def test_a_single_cell_pool_needs_no_quorum_store(self):
         """One cell never renegotiates a quorum, so binding a port for it would be pure waste."""
-        group = _make_controller(num_cells=1)
+        group = await _make_alive_controller(num_cells=1)
 
         assert group._indep_dp_store_addr is None
 
@@ -996,7 +997,7 @@ class TestLogStepEndEvent:
 
 
 class TestCellStatusesUnderConcurrentReconcile:
-    def test_a_cell_removed_while_the_statuses_are_read_does_not_abort_the_read(self):
+    async def test_a_cell_removed_while_the_statuses_are_read_does_not_abort_the_read(self):
         """The api server reads this from its own thread while reconcile adds and drops cells,
         and iterating the live dict raises RuntimeError instead of answering the request."""
         controller = _make_controller(num_cells=3)
@@ -1010,17 +1011,33 @@ class TestCellStatusesUnderConcurrentReconcile:
 
         controller._cells_by_id[f"{controller._pool_id}-0"] = _EvictingCell()
 
-        statuses = controller.get_cell_statuses()
+        statuses = await controller.get_cell_statuses()
 
         # The snapshot is taken before the first cell_status() call, so the evicted cell is still
         # answered for. What matters is that the read completes instead of raising.
         assert set(statuses) == {f"{controller._pool_id}-{i}" for i in range(3)}
 
 
+class TestModelIdGuard:
+    async def test_the_controller_names_the_model_it_trains(self):
+        """A composite controller routes by model id, so each trainer has to name its own."""
+        group = _make_controller(num_cells=1)
+
+        assert group.model_id == DEFAULT_TRAINER_ROLE
+
+    async def test_a_call_for_another_model_is_refused(self):
+        """Answering for a model it does not train would push the wrong weights into that policy."""
+        group = _make_controller(num_cells=1)
+
+        with pytest.raises(AssertionError, match="cannot answer for model"):
+            await group.offload(model_id="critic")
+
+
 class TestUpdateWeightsReturnsTheVersion:
     def _make_group(self, *, per_worker_versions: list[int | None]) -> TrainerController:
         group = TrainerController.__new__(TrainerController)
         group.args = SimpleNamespace(debug_train_only=False, debug_rollout_only=False)
+        group._role = DEFAULT_TRAINER_ROLE
         group._execute_first_alive = AsyncMock(return_value=per_worker_versions)
         return group
 

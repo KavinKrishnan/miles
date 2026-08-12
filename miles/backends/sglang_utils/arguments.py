@@ -1,7 +1,6 @@
 import argparse
 
 from sglang.srt.server_args import ServerArgs
-from miles.utils.http_utils import _wrap_ipv6
 
 
 # TODO: use all sglang router arguments with `--sglang-router` prefix
@@ -9,12 +8,6 @@ def add_sglang_router_arguments(parser):
     """
     Add arguments to the parser for the SGLang router.
     """
-    parser.add_argument(
-        "--sglang-router-ip",
-        type=str,
-        default=None,
-        help="IP address of the SGLang router",
-    )
     parser.add_argument(
         "--sglang-router-port",
         type=int,
@@ -201,6 +194,3 @@ def validate_args(args):
         args.sglang_router_policy = "manual"
         if args.router_assignment_mode == "random":
             args.router_assignment_mode = "min_load"
-
-    if getattr(args, "sglang_router_ip", None):
-        args.sglang_router_ip = _wrap_ipv6(args.sglang_router_ip)

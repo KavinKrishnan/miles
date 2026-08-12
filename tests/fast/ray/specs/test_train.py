@@ -4,19 +4,21 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 from tests.fast.fixtures.capability_fixtures import FakeBackendCapability
 
+from miles.backends.sglang_utils.sglang_config import _compute_megatron_num_gpus, _compute_rollout_offset
 from miles.ray.specs.train import (
     TRAINER_CONCURRENCY_GROUPS,
     TRAINER_CONTROLLER_WORKER_CLASS,
-    compute_trainer_controller_pool_id,
-    compute_trainer_pool_id,
-    spec_trainer_controller_actor,
-    spec_trainer_controller_critic,
+    compute_trainer_gpu_budget,
+    create_composite_trainer_controller,
     specs_trainer,
+    specs_trainer_controller,
     trainer_controller_cell_id,
     trainer_controller_worker_name,
 )
+from miles.ray.specs.trainer_identity import compute_trainer_controller_pool_id, compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import SECTION_OF_CATEGORY, LaunchPlan
@@ -26,6 +28,8 @@ from miles.utils.workers.worker_spec import WorkerCtorContext
 
 def _make_args(**overrides) -> SimpleNamespace:
     args = SimpleNamespace(
+        deploy_component="all",
+        megatron_config=None,
         actor_num_nodes=1,
         actor_num_gpus_per_node=4,
         critic_num_nodes=1,
@@ -48,6 +52,17 @@ def _make_args(**overrides) -> SimpleNamespace:
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
+
+
+def _write_megatron_config(tmp_path, models: list[dict[str, str]]) -> str:
+    path = tmp_path / "megatron.yaml"
+    path.write_text(yaml.dump({"megatron": models}))
+    return str(path)
+
+
+def _make_multi_policy_args(tmp_path, models: list[dict[str, str]] | None = None, **overrides) -> SimpleNamespace:
+    models = models if models is not None else [{"name": "alpha"}, {"name": "beta"}]
+    return _make_args(megatron_config=_write_megatron_config(tmp_path, models), **overrides)
 
 
 def _make_context(**overrides) -> WorkerCtorContext:
@@ -302,7 +317,7 @@ class TestPorts:
 @pytest.mark.parametrize("role", ["actor", "critic"])
 def test_the_pool_name_encodes_the_role(role):
     """Spec names identify trainer cells apart from inference cells."""
-    assert compute_trainer_pool_id(role) == f"trainer-{role}"
+    assert compute_trainer_pool_id(role) == f"trainer-engine-{role}"
 
 
 class _FakeStaticProvider:
@@ -338,12 +353,15 @@ def _controller_providers() -> FakeBackendCapability:
 class TestSpecTrainerController:
     def test_one_controller_per_trainer_role(self):
         """Each controller owns exactly one trainer pool, so a critic run needs a second one."""
-        assert spec_trainer_controller_actor(_make_args()).name == "trainer-controller-actor"
-        assert spec_trainer_controller_critic(_make_args(use_critic=True)).name == "trainer-controller-critic"
+        assert [spec.name for spec in specs_trainer_controller(_make_args())] == ["trainer-controller-actor"]
+        assert [spec.name for spec in specs_trainer_controller(_make_args(use_critic=True))] == [
+            "trainer-controller-actor",
+            "trainer-controller-critic",
+        ]
 
     def test_it_is_a_gpuless_worker_on_both_backends(self):
         """A gpu request would reserve a whole trainer slot for a process that only sends rpcs."""
-        spec = spec_trainer_controller_actor(_make_args())
+        (spec,) = specs_trainer_controller(_make_args())
 
         assert (spec.scheduling.num_cells, spec.scheduling.num_workers_per_cell) == (1, 1)
         assert spec.scheduling.num_gpus_per_worker == 0
@@ -351,7 +369,7 @@ class TestSpecTrainerController:
 
     def test_the_worker_class_is_the_controller_itself(self):
         """The spec names the class a pod or actor constructs, so it must be the real implementation."""
-        spec = spec_trainer_controller_actor(_make_args())
+        (spec,) = specs_trainer_controller(_make_args())
 
         assert spec.worker_class == TRAINER_CONTROLLER_WORKER_CLASS
 
@@ -362,7 +380,7 @@ class TestSpecTrainerController:
 
     def test_it_renders_into_static_workers_with_its_rpc_port(self):
         """The release has to contain the controller pod, or the address book would point at nothing."""
-        spec = spec_trainer_controller_actor(_make_args())
+        (spec,) = specs_trainer_controller(_make_args())
 
         values = build_values([spec], _controller_layout()).as_values()
 
@@ -378,7 +396,7 @@ class TestSpecTrainerController:
         capability = _controller_providers()
 
         args = _make_args(use_critic=True)
-        specs = [spec_trainer_controller_actor(args), spec_trainer_controller_critic(args)]
+        specs = specs_trainer_controller(args)
         kwargs = [spec.ctor_kwargs(_controller_context(capability)) for spec in specs]
 
         assert capability.requested_pool_ids == [["trainer-engine-actor"], ["trainer-engine-critic"]]
@@ -389,7 +407,7 @@ class TestSpecTrainerController:
         capability = _controller_providers()
 
         args = _make_args(use_critic=True)
-        actor_spec, critic_spec = spec_trainer_controller_actor(args), spec_trainer_controller_critic(args)
+        actor_spec, critic_spec = specs_trainer_controller(args)
         actor_kwargs = actor_spec.ctor_kwargs(_controller_context(capability))
         critic_kwargs = critic_spec.ctor_kwargs(_controller_context(capability))
 
@@ -401,26 +419,223 @@ class TestSpecTrainerController:
         """These are functions of args, so the worker can answer them from the argv it parses itself."""
         capability = _controller_providers()
 
-        spec = spec_trainer_controller_actor(_make_args(kl_coef=0.1, use_opd=True, opd_type="megatron"))
+        (spec,) = specs_trainer_controller(_make_args(kl_coef=0.1, use_opd=True, opd_type="megatron"))
         kwargs = spec.ctor_kwargs(_controller_context(capability))
 
         assert (kwargs["role"], kwargs["with_ref"], kwargs["with_opd_teacher"]) == ("actor", True, True)
 
     def test_the_critic_controller_gets_no_reference_or_teacher_cells(self):
         """A critic controller must not hand its cells the actor's KL and OPD settings."""
-        spec = spec_trainer_controller_critic(_make_args(use_critic=True, kl_coef=0.1, use_kl_loss=True, use_opd=True))
-        critic_kwargs = spec.ctor_kwargs(_controller_context(_controller_providers()))
+        _actor_spec, critic_spec = specs_trainer_controller(
+            _make_args(use_critic=True, kl_coef=0.1, use_kl_loss=True, use_opd=True)
+        )
+        critic_kwargs = critic_spec.ctor_kwargs(_controller_context(_controller_providers()))
 
         assert (critic_kwargs["with_ref"], critic_kwargs["with_opd_teacher"]) == (False, False)
 
     def test_no_args_are_frozen_into_the_controller_at_spec_time(self):
         """The spec is built before the driver finishes deriving args, so a captured copy would be stale."""
-        actor_kwargs = spec_trainer_controller_actor(_make_args()).ctor_kwargs(
-            _controller_context(_controller_providers())
-        )
+        (spec,) = specs_trainer_controller(_make_args())
+        actor_kwargs = spec.ctor_kwargs(_controller_context(_controller_providers()))
 
         assert "args" not in actor_kwargs
 
     def test_the_controller_pool_name_encodes_the_role(self):
         """The two controllers of a critic run must not collide in the address book."""
         assert compute_trainer_controller_pool_id("critic") == "trainer-controller-critic"
+
+
+_THREE_POLICIES = [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}]
+
+
+class TestMultiPolicySpecSet:
+    def test_every_policy_model_gets_its_own_controller(self, tmp_path):
+        """A policy whose controller is missing has nobody to drive its cells."""
+        specs = specs_trainer_controller(_make_multi_policy_args(tmp_path, _THREE_POLICIES))
+
+        assert [spec.name for spec in specs] == [
+            "trainer-controller-alpha",
+            "trainer-controller-beta",
+            "trainer-controller-gamma",
+        ]
+        assert [spec.deploy_instance for spec in specs] == ["alpha", "beta", "gamma"]
+
+    def test_every_policy_model_gets_its_own_trainer_engine_pool(self, tmp_path):
+        """Two policies sharing one pool would put both models' ranks into a single collective."""
+        specs = specs_trainer(_make_multi_policy_args(tmp_path, _THREE_POLICIES))
+
+        assert [spec.name for spec in specs] == [
+            "trainer-engine-alpha",
+            "trainer-engine-beta",
+            "trainer-engine-gamma",
+        ]
+        assert [spec.deploy_instance for spec in specs] == ["alpha", "beta", "gamma"]
+
+    def test_a_policy_controller_and_its_engines_carry_the_same_deploy_instance(self, tmp_path):
+        """A split trainer release installs one policy, so its controller and ranks must be selected together."""
+        args = _make_multi_policy_args(tmp_path, _THREE_POLICIES)
+
+        controllers = specs_trainer_controller(args)
+        engines = specs_trainer(args)
+
+        assert [spec.deploy_instance for spec in controllers] == [spec.deploy_instance for spec in engines]
+
+    def test_the_policies_are_laid_out_end_to_end_in_the_shared_placement_group(self, tmp_path):
+        """Two policies starting at the same slot would train on each other's gpus."""
+        args = _make_multi_policy_args(
+            tmp_path,
+            [
+                {"name": "alpha", "args": "--actor-num-gpus-per-node 2"},
+                {"name": "beta"},
+                {"name": "gamma", "args": "--actor-num-gpus-per-node 1"},
+            ],
+        )
+
+        specs = specs_trainer(args)
+
+        assert [spec.scheduling.pg_slot_offset for spec in specs] == [0, 2, 6]
+
+    def test_the_critic_still_starts_at_the_front_of_the_policy_slice(self, tmp_path):
+        """Shared PPO overlays the critic on the actor's own gpus rather than appending it."""
+        args = _make_multi_policy_args(tmp_path, [{"name": "alpha"}, {"name": "beta"}], use_critic=True)
+
+        specs = specs_trainer(args)
+
+        assert [spec.name for spec in specs] == [
+            "trainer-engine-alpha",
+            "trainer-engine-beta",
+            "trainer-engine-critic",
+        ]
+        assert [spec.scheduling.pg_slot_offset for spec in specs] == [0, 4, 0]
+
+    def test_a_per_policy_override_reaches_only_its_own_worker(self, tmp_path):
+        """--megatron-config gives each policy its own args, and a leaked override resizes the wrong world."""
+        args = _make_multi_policy_args(
+            tmp_path, [{"name": "alpha", "args": "--actor-num-gpus-per-node 2"}, {"name": "beta"}]
+        )
+
+        specs = specs_trainer(args)
+        worker_args = [spec.ctor_kwargs(_make_context())["args"] for spec in specs]
+
+        assert [one.actor_num_gpus_per_node for one in worker_args] == [2, 4]
+        assert [one.trainer_model_id for one in worker_args] == ["alpha", "beta"]
+        assert [spec.scheduling.num_workers_per_cell for spec in specs] == [2, 4]
+
+    def test_a_policy_controller_watches_only_its_own_engine_pool(self, tmp_path):
+        """A controller that watched every policy's pool would heal another model's cells."""
+        capability = _controller_providers()
+        args = _make_multi_policy_args(tmp_path, [{"name": "alpha"}, {"name": "beta"}])
+
+        for spec in specs_trainer_controller(args):
+            spec.ctor_kwargs(_controller_context(capability))
+
+        assert capability.requested_pool_ids == [["trainer-engine-alpha"], ["trainer-engine-beta"]]
+
+
+class TestComputeTrainerGpuBudget:
+    def test_a_single_policy_run_budgets_its_one_trainer(self):
+        """The placement group is sized from this, so it must still cover the plain actor run."""
+        assert compute_trainer_gpu_budget(_make_args(actor_num_nodes=2, actor_num_gpus_per_node=8)) == 16
+
+    def test_the_budget_is_the_sum_of_every_policy_trainer(self, tmp_path):
+        """Every policy trains on gpus of its own, so the run has to reserve all of them at once."""
+        args = _make_multi_policy_args(
+            tmp_path,
+            [
+                {"name": "alpha", "args": "--actor-num-gpus-per-node 2"},
+                {"name": "beta"},
+                {"name": "gamma", "args": "--actor-num-nodes 2"},
+            ],
+        )
+
+        assert compute_trainer_gpu_budget(args) == 2 + 4 + 8
+
+    def test_the_critic_shares_the_policy_gpus_instead_of_adding_its_own(self):
+        """Shared PPO colocates the critic with the actor, so counting it would over-reserve the cluster."""
+        args = _make_args(use_critic=True, critic_num_nodes=1, critic_num_gpus_per_node=4)
+
+        assert compute_trainer_gpu_budget(args) == 4
+
+    def test_a_launch_that_deploys_no_trainer_budgets_nothing(self):
+        """An inference release reserves rollout gpus only, and its engines start at slot zero."""
+        assert compute_trainer_gpu_budget(_make_args(deploy_component="inference")) == 0
+
+    def test_the_sglang_layout_reads_the_same_budget(self, tmp_path):
+        """Two gpu layouts that disagree place engines on gpus the trainers already hold."""
+        args = _make_multi_policy_args(
+            tmp_path,
+            [{"name": "alpha", "args": "--actor-num-gpus-per-node 2"}, {"name": "beta"}],
+        )
+        args.debug_train_only = False
+        args.debug_rollout_only = False
+        args.colocate = False
+        args.critic_train_only = False
+
+        assert _compute_rollout_offset(args) == compute_trainer_gpu_budget(args)
+        assert _compute_megatron_num_gpus(args) == compute_trainer_gpu_budget(args)
+
+
+class TestDeployedTrainerInstances:
+    def test_naming_one_policy_deploys_that_instance_alone(self, tmp_path):
+        """A trainer release installs one policy, and installing its neighbours would double the gpu bill."""
+        args = _make_multi_policy_args(tmp_path, _THREE_POLICIES, deploy_component="trainer:beta")
+
+        assert [spec.name for spec in specs_trainer_controller(args)] == ["trainer-controller-beta"]
+        assert [spec.name for spec in specs_trainer(args)] == ["trainer-engine-beta"]
+
+    def test_a_named_instance_is_rebased_to_the_start_of_its_own_placement_group(self, tmp_path):
+        """A split release creates a placement group holding only this policy, so its slots start at zero."""
+        models = [{"name": "alpha", "args": "--actor-num-gpus-per-node 2"}, {"name": "beta"}]
+        args = _make_multi_policy_args(tmp_path, models, deploy_component="trainer:beta")
+
+        (spec,) = specs_trainer(args)
+
+        assert spec.scheduling.pg_slot_offset == 0
+        assert compute_trainer_gpu_budget(args) == 4
+
+    def test_naming_no_instance_still_deploys_every_policy(self, tmp_path):
+        """--deploy-component trainer is the whole trainer side, not an unnamed first instance."""
+        args = _make_multi_policy_args(tmp_path, _THREE_POLICIES, deploy_component="trainer")
+
+        assert [spec.name for spec in specs_trainer(args)] == [
+            "trainer-engine-alpha",
+            "trainer-engine-beta",
+            "trainer-engine-gamma",
+        ]
+
+    def test_naming_an_unknown_trainer_instance_fails_loudly(self, tmp_path):
+        """A typo that deployed nothing would leave the run waiting forever for a policy nobody trains."""
+        args = _make_multi_policy_args(tmp_path, _THREE_POLICIES, deploy_component="trainer:delta")
+
+        with pytest.raises(AssertionError, match="names a trainer instance this run does not train"):
+            specs_trainer(args)
+
+
+class TestCreateCompositeTrainerController:
+    def test_a_single_deployment_run_builds_its_trainers_from_its_own_release(self, tmp_path):
+        """The composite is a plain object over specs, so it must work without one release per trainer."""
+        args = _make_multi_policy_args(tmp_path, [{"name": "alpha"}, {"name": "beta"}])
+        capability = FakeBackendCapability(static_provider=_HandleProvider())
+
+        composite = create_composite_trainer_controller(args, capability=capability)
+
+        assert sorted(composite.model_ids) == ["alpha", "beta"]
+        assert capability.requested_static_pool_ids == [
+            compute_trainer_controller_pool_id("alpha"),
+            compute_trainer_controller_pool_id("beta"),
+        ]
+
+    def test_a_single_policy_run_builds_one_trainer_under_its_default_role(self, tmp_path):
+        """A run that trains one policy keeps spelling its trainer `actor`."""
+        args = _make_args()
+        capability = FakeBackendCapability(static_provider=_HandleProvider())
+
+        composite = create_composite_trainer_controller(args, capability=capability)
+
+        assert composite.model_ids == ["default"]
+        assert capability.requested_static_pool_ids == [compute_trainer_controller_pool_id("actor")]
+
+
+class _HandleProvider:
+    def get_handle(self, worker_name: str) -> object:
+        return SimpleNamespace(worker_name=worker_name)

@@ -272,6 +272,15 @@ def resolve_sglang_config(args) -> SglangConfig:
     return SglangConfig.resolve(raw, args)
 
 
+def compute_num_engines(model_cfg: ModelConfig) -> int:
+    """How many engines a model's own deployment launches, which is how many cells serve it."""
+    return sum(
+        group_cfg.num_gpus // group_cfg.num_gpus_per_engine
+        for group_cfg in model_cfg.server_groups
+        if group_cfg.worker_type != "placeholder"
+    )
+
+
 def _compute_raw_sglang_config(args) -> _RawSglangConfig:
     eval_num_gpus = args.eval_num_gpus
 
@@ -360,17 +369,15 @@ def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
         return 0
-    if getattr(args, "critic_train_only", False):
-        return args.critic_num_nodes * args.critic_num_gpus_per_node
-    offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-    return offset
+    return _compute_megatron_num_gpus(args)
 
 
 def _compute_megatron_num_gpus(args) -> int:
     """Total number of megatron (actor + critic) GPU slots in the placement group."""
+    from miles.ray.specs.train import compute_trainer_gpu_budget
+
     if getattr(args, "debug_rollout_only", False):
         return 0
     if getattr(args, "critic_train_only", False):
         return args.critic_num_nodes * args.critic_num_gpus_per_node
-    num = args.actor_num_nodes * args.actor_num_gpus_per_node
-    return num
+    return compute_trainer_gpu_budget(args)

@@ -18,8 +18,10 @@ PACKAGE = "miles.utils.external_utils.miles_workbench"
 PROGRAM_NAME = f"python -m {PACKAGE}"
 
 
-def run_release_name(run_id: str, deploy_component: DeployComponent = DeployComponent.ALL) -> str:
-    return RunNames.release(run_id=run_id, deploy_component=deploy_component)
+def run_release_name(
+    run_id: str, deploy_component: DeployComponent = DeployComponent.ALL, deploy_instance: str | None = None
+) -> str:
+    return RunNames.release(run_id=run_id, deploy_component=deploy_component, deploy_instance=deploy_instance)
 
 
 def object_name(release: str) -> str:

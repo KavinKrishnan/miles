@@ -252,6 +252,7 @@ class TestRolloutCellHealthCheckerDisposal:
 async def _make_controller_with_serving_cell() -> tuple[InferenceController, ServerCell]:
     args: Any = make_args(ft_components=["rollout"], colocate=True)
     controller = InferenceController.__new__(InferenceController)
+    controller._cell_reconcile_slots = {}
     controller.args = args
     controller.context_lock = ContextLock("InferenceController")
     controller._health_checker_activeness = ActivenessTracker(active=True)
@@ -266,7 +267,7 @@ async def _make_controller_with_serving_cell() -> tuple[InferenceController, Ser
     controller.servers = {"default": srv}
 
     async with controller.context_lock:
-        await srv.add_cell(_make_meta())
+        srv.commit_cell(await srv.bring_up_cell(_make_meta()))
 
     cell: ServerCell = track_server_cell(srv.server_cells["inference-engine-0-0-0"])
     cell.router_api_client = _NoopRouterApiClient()

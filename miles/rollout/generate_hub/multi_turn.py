@@ -18,6 +18,7 @@ from miles.rollout.generate_utils.tool_call_utils import (
     execute_tool_calls,
     update_sample_with_tool_responses,
 )
+from miles.rollout.router_addressing import compute_sample_router_url
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import post
 from miles.utils.lifecycle import TrajectoryLifecycle
@@ -31,7 +32,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     tokenizer = input.state.tokenizer
     assert not args.partial_rollout, "Partial rollout is not supported"
 
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_sample_router_url(args, sample, endpoint="/generate")
 
     execute_tool_function = load_function(args.generate_execute_tool_function_path)
 

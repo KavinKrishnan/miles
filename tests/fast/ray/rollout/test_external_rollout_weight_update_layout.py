@@ -12,8 +12,8 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 )
 from miles.ray.rollout import external_engine_provider as external_engine_provider_module
 from miles.ray.rollout.external_engine_provider import StaticInferenceEngineWorkerProvider
-from miles.ray.rollout.inference_controller import _compute_server_cell_meta_from_info
 from miles.ray.rollout.rollout_server import RolloutServer
+from miles.ray.rollout.server_cell import compute_server_cell_meta_from_info
 from miles.utils.context_lock import ContextLock
 
 _BROADCAST_MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast"
@@ -52,7 +52,7 @@ async def _discovered_server(monkeypatch, *, payloads: dict[str, dict[str, Any]]
 
     cells = {}
     for info in provider.cell_infos:
-        meta = _compute_server_cell_meta_from_info(info)
+        meta = compute_server_cell_meta_from_info(info)
         cells[info.cell_id] = SimpleNamespace(meta=meta, api_client=f"client-{meta.gpu_offset}")
     return RolloutServer(
         server_cells=cells,

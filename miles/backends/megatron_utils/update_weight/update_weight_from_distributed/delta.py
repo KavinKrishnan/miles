@@ -24,6 +24,7 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils import async_utils
 from miles.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.trainer_artifacts import compute_trainer_artifact_dir
 
 from ..common import _check_weight_sync_results
 from .mixin import DistBucketedWeightUpdateMixin
@@ -60,10 +61,11 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
         self.quantization_config = quantization_config
         self.weight_version = 0
         self.rollout_engines: Sequence[SGLangApiClient] | None = None
-        self.delta_dir = args.update_weight_disk_dir
+        self.delta_dir = compute_trainer_artifact_dir(args, root=args.update_weight_disk_dir)
         os.makedirs(self.delta_dir, exist_ok=True)
         self.delta_encoding = args.update_weight_delta_encoding
         self.checksum_algorithm = args.update_weight_delta_checksum
+        self._local_checkpoint_dir = compute_trainer_artifact_dir(args, root=args.update_weight_local_checkpoint_dir)
         self._snapshot: dict[str, np.ndarray] = {}
         self._baseline_captured = False
         # Post-write hook: object-store-backed shared filesystems lack cross-host
@@ -131,8 +133,8 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
                 async_utils.submit(
                     client.pull_weights(
                         target_version=0,
-                        local_checkpoint_dir=self.args.update_weight_local_checkpoint_dir,
-                        source_dir=self.args.update_weight_disk_dir,
+                        local_checkpoint_dir=self._local_checkpoint_dir,
+                        source_dir=self.delta_dir,
                     )
                 )
                 for client in self.rollout_engines
@@ -161,7 +163,7 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
                     [
                         async_utils.submit(
                             client.update_weights_from_disk(
-                                model_path=self.args.update_weight_local_checkpoint_dir,
+                                model_path=self._local_checkpoint_dir,
                                 weight_version=str(self.weight_version),
                             )
                         )
@@ -263,8 +265,8 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
                     async_utils.submit(
                         client.pull_weights(
                             target_version=self.weight_version,
-                            local_checkpoint_dir=self.args.update_weight_local_checkpoint_dir,
-                            source_dir=self.args.update_weight_disk_dir,
+                            local_checkpoint_dir=self._local_checkpoint_dir,
+                            source_dir=self.delta_dir,
                         )
                     )
                     for client in self.rollout_engines
@@ -281,7 +283,7 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
                 [
                     async_utils.submit(
                         client.update_weights_from_disk(
-                            model_path=self.args.update_weight_local_checkpoint_dir,
+                            model_path=self._local_checkpoint_dir,
                             weight_version=str(self.weight_version),
                         )
                     )

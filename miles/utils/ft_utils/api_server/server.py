@@ -9,10 +9,12 @@ from starlette.responses import JSONResponse
 
 from miles.ray.specs.inference import compute_engine_pool_ids
 from miles.ray.specs.train import compute_trainer_pool_id
+from miles.ray.specs.trainer_identity import compute_policy_trainer_roles
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.models import Cell, CellList, CellPatch, FaultInjection, K8sStatus, _OkResponse
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 from miles.utils.workers.cell_operations.base import BaseCellOperations
+from miles.utils.workers.types import DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 
 logger = logging.getLogger(__name__)
@@ -31,18 +33,19 @@ def start_api_server(
     cell_operations: BaseCellOperations,
 ) -> None:
     handlers: list[_CellHandler] = []
+    watches_own_cells = not DeploySelector.of(args).is_split()
 
-    if "train" in ft_components:
+    if watches_own_cells and "train" in ft_components:
         handlers.append(
             _CellHandler(
                 cell_type="actor",
                 operations=cell_operations,
                 controller=actor_model,
-                pool_ids=[compute_trainer_pool_id("actor")],
+                pool_ids=[compute_trainer_pool_id(role) for role in compute_policy_trainer_roles(args)],
             )
         )
 
-    if "rollout" in ft_components:
+    if watches_own_cells and "rollout" in ft_components:
         handlers.append(
             _CellHandler(
                 cell_type="rollout",

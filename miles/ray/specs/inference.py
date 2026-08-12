@@ -2,10 +2,18 @@ import logging
 import os
 import shlex
 import sys
+from functools import partial
+from typing import Any
 
 from miles.backends.sglang_utils.router_args_utils import compute_sglang_router_args, router_args_to_argv
-from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, resolve_sglang_config
+from miles.backends.sglang_utils.sglang_config import (
+    ModelConfig,
+    ServerGroupConfig,
+    compute_num_engines,
+    resolve_sglang_config,
+)
 from miles.backends.sglang_utils.sglang_engine import compute_engine_launch_cmd
+from miles.ray.rollout.server_cell import compute_server_cell_refusal_reason
 from miles.ray.specs.static_addrs import inference_controller_urls, static_router_addrs
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.rollout.session.config import compute_session_server_config
@@ -16,9 +24,12 @@ from miles.utils.workers.argv_utils import config_to_argv
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.launch_gate import GATE_PORT_NAME
 from miles.utils.workers.naming import compute_worker_name
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
+from miles.utils.workers.registration.reporter import RegistrationReporter
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.fan_in import FanInWorkerProvider
 from miles.utils.workers.worker_provider.simple import SimpleWorkerProvider
 from miles.utils.workers.worker_spec import (
     CommandWorkerSpec,
@@ -35,28 +46,118 @@ POOL_CATEGORY_INFERENCE_ENGINE = "inference_engine"
 INFERENCE_CONTROLLER_POOL_ID = "inference-controller"
 SESSION_SERVER_POOL_ID = "session-server"
 INFERENCE_CONTROLLER_WORKER_CLASS = "miles.ray.rollout.inference_controller.InferenceController"
+REGISTRATION_REPORTER_POOL_ID = "registration-reporter"
+REGISTRATION_REPORTER_WORKER_CLASS = "miles.utils.workers.registration.reporter.RegistrationReporterWorker"
+REGISTRATION_EXTERNAL_HOSTS_FLAG = "--registration-external-hosts"
 
 
-def spec_inference_controller(args) -> ServeWorkerSpec:
-    return ServeWorkerSpec(
-        name=INFERENCE_CONTROLLER_POOL_ID,
-        deploy_component=DeployComponent.INFERENCE,
-        port_infos=[],
-        env_var=lambda _ctx: {},
-        scheduling=SchedulingSpec(
-            num_cells=1,
-            num_workers_per_cell=1,
-            num_gpus_per_worker=0,
-            num_cpus_per_worker=1,
-            pin_to_head=args.pin_rollout_manager_to_head,
+def specs_inference_controller(args) -> list[ServeWorkerSpec]:
+    if compute_inference_instance_name(args) is not None:
+        return []
+
+    return [
+        ServeWorkerSpec(
+            name=INFERENCE_CONTROLLER_POOL_ID,
+            deploy_component=DeployComponent.INFERENCE,
+            port_infos=[],
+            env_var=lambda _ctx: {},
+            scheduling=SchedulingSpec(
+                num_cells=1,
+                num_workers_per_cell=1,
+                num_gpus_per_worker=0,
+                num_cpus_per_worker=1,
+                pin_to_head=args.pin_rollout_manager_to_head,
+            ),
+            worker_class=INFERENCE_CONTROLLER_WORKER_CLASS,
+            ctor_kwargs=lambda ctx: compute_inference_controller_kwargs(args, capability=ctx.capability),
+        )
+    ]
+
+
+def compute_inference_controller_kwargs(args, *, capability: BackendCapability) -> dict[str, Any]:
+    registration_provider = compute_registration_provider(args)
+    engine_provider = compute_engine_provider(args, capability=capability)
+    return dict(
+        args=args,
+        engine_provider=(
+            engine_provider
+            if registration_provider is None
+            else FanInWorkerProvider(providers=[engine_provider, registration_provider])
         ),
-        worker_class=INFERENCE_CONTROLLER_WORKER_CLASS,
-        ctor_kwargs=lambda ctx: dict(
-            args=args,
-            engine_provider=compute_engine_provider(args, capability=ctx.capability),
-            router_providers=compute_router_providers(args, capability=ctx.capability),
-        ),
+        router_providers=compute_router_providers(args, capability=capability),
+        registration_provider=registration_provider,
     )
+
+
+def compute_registration_provider(args) -> RegistrationWorkerProvider | None:
+    if args.expected_registration_reporters == 0:
+        return None
+    model_ids = {model_cfg.name for model_cfg in resolve_sglang_config(args).models}
+    return RegistrationWorkerProvider(
+        expected_num_reporters=args.expected_registration_reporters,
+        token=args.registration_token,
+        refuse_cell=partial(compute_server_cell_refusal_reason, model_ids=model_ids),
+    )
+
+
+def compute_inference_instance_name(args) -> str | None:
+    return DeploySelector.of(args).instance
+
+
+def specs_registration_reporter(args) -> list[ServeWorkerSpec]:
+    if (instance_name := compute_inference_instance_name(args)) is None:
+        return []
+
+    return [
+        ServeWorkerSpec(
+            name=REGISTRATION_REPORTER_POOL_ID,
+            deploy_component=DeployComponent.INFERENCE,
+            deploy_instance=instance_name,
+            port_infos=[],
+            env_var=lambda _ctx: {},
+            scheduling=SchedulingSpec(
+                num_cells=1,
+                num_workers_per_cell=1,
+                num_gpus_per_worker=0,
+                num_cpus_per_worker=1,
+                pin_to_head=args.pin_rollout_manager_to_head,
+            ),
+            worker_class=REGISTRATION_REPORTER_WORKER_CLASS,
+            ctor_kwargs=lambda ctx: dict(
+                reporter=compute_registration_reporter(args, instance_name=instance_name, capability=ctx.capability)
+            ),
+        )
+    ]
+
+
+def compute_registration_reporter(args, *, instance_name: str, capability: BackendCapability) -> RegistrationReporter:
+    controller_provider = compute_inference_controller_provider(args, capability=capability)
+    return RegistrationReporter(
+        reporter_id=instance_name,
+        create_controller=lambda: controller_provider.get_handle(inference_controller_worker_name()),
+        engine_provider=compute_engine_provider(args, capability=capability),
+        expected_num_cells_by_model={
+            model_cfg.name: compute_num_engines(model_cfg) for model_cfg in resolve_sglang_config(args).models
+        },
+        pool_id_prefix=instance_name,
+        external_host_by_host=compute_registration_external_hosts(args),
+        token=args.registration_token,
+    )
+
+
+def compute_registration_external_hosts(args) -> dict[str, str]:
+    if (entries := args.registration_external_hosts) is None:
+        return {}
+
+    ans: dict[str, str] = {}
+    for entry in entries:
+        host, separator, external_host = entry.partition("=")
+        assert separator and host and external_host, (
+            f"{REGISTRATION_EXTERNAL_HOSTS_FLAG} takes <host>=<external host> entries, so {entry!r} does not name "
+            f"a translation"
+        )
+        ans[host] = external_host
+    return ans
 
 
 def compute_engine_provider(args, *, capability: BackendCapability) -> BaseWorkerProvider:
@@ -100,6 +201,9 @@ def inference_controller_worker_name() -> str:
 
 
 def specs_router(args) -> list[CommandWorkerSpec]:
+    if compute_inference_instance_name(args) is not None:
+        return []
+
     config = resolve_sglang_config(args)  # TODO avoid resolve repeatedly
     return [
         _compute_spec_router(args, model_idx=model_idx, model_cfg=model_cfg)
@@ -115,7 +219,7 @@ def compute_router_worker_name(model_idx: int) -> str:
     return compute_worker_name(pool_id=compute_router_pool_id(model_idx))
 
 
-def _compute_spec_router(args, model_idx: int, model_cfg: ModelConfig) -> CommandWorkerSpec:
+def _compute_spec_router(args, *, model_idx: int, model_cfg: ModelConfig) -> CommandWorkerSpec:
     def _compute_launch_command(ctx: LaunchCommandContext) -> str:
         primary = ctx.self_addrs["primary"]
 

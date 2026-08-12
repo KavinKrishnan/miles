@@ -1,10 +1,11 @@
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pydantic import ValidationError
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, probe_server_healthy
@@ -29,8 +30,13 @@ from miles.utils.ft_utils.health_checker import (
     SimpleHealthCheckerConfig,
 )
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
-from miles.utils.workers.launch_gate import GATE_PORT_NAME, activate_launch_gate
-from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.launch_gate import (
+    GATE_PORT_NAME,
+    GATE_TIMEOUT_META_KEY,
+    LAUNCH_GATE_TIMEOUT_SECONDS,
+    activate_launch_gate,
+)
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,7 @@ class ServerCellMetadata(FrozenStrictBaseModel):
     needs_offload: bool
     update_weights: bool
     workers_hash: str
+    launch_gate_timeout_seconds: float = LAUNCH_GATE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -129,6 +136,10 @@ class ServerCell:
         return isinstance(self._state, StateServing)
 
     @property
+    def is_unreachable(self) -> bool:
+        return self.is_pending_weights_or_serving and self._health_checker.status is TriState.FALSE
+
+    @property
     def addr_info(self) -> CellAddrInfo:
         assert isinstance(self._state, (StateInitializing, StatePendingWeights, StateServing))
         return self._state.addr_info
@@ -144,7 +155,7 @@ class ServerCell:
     async def init(self) -> None:
         addr_info = await self._compute_addr_info()
         if (gate_url := addr_info.gate_url) is not None:
-            await activate_launch_gate(gate_url=gate_url)
+            await activate_launch_gate(gate_url=gate_url, timeout=self.meta.launch_gate_timeout_seconds)
         self._change_state("init", StateUninitialized, StateInitializing(addr_info=addr_info))
 
     async def tick(self) -> None:
@@ -274,6 +285,50 @@ class ServerCell:
         return await self.api_client.check_weights(
             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
         )
+
+
+# TODO may move and generalize later
+def compute_server_cell_meta_from_info(info: CellInfo) -> ServerCellMetadata:
+    return ServerCellMetadata(
+        model_id=info.meta["model_id"],
+        worker_type=info.meta["worker_type"],
+        cell_id=info.cell_id,
+        num_gpus_per_engine=info.meta["num_gpus_per_engine"],
+        gpu_offset=info.meta["gpu_offset"],
+        sglang_api_key=info.meta["sglang_api_key"],
+        worker_name=info.worker_names[0],
+        needs_offload=info.meta["needs_offload"],
+        update_weights=info.meta["update_weights"],
+        workers_hash=info.workers_hash,
+        launch_gate_timeout_seconds=info.meta.get(GATE_TIMEOUT_META_KEY, LAUNCH_GATE_TIMEOUT_SECONDS),
+    )
+
+
+def compute_server_cell_refusal_reason(info: CellInfo, *, model_ids: Collection[str]) -> str | None:
+    try:
+        cell_meta = compute_server_cell_meta_from_info(info)
+    except KeyError as e:
+        return (
+            f"its metadata carries no {e.args[0]!r}, and every cell this run serves is built from that field; what "
+            f"it did carry is {sorted(info.meta)}, so the two deployments run different versions of miles"
+        )
+    except ValidationError as e:
+        return (
+            f"its metadata does not describe an engine this run can serve ({_summarize_validation_error(e)}), so "
+            f"the two deployments run different versions of miles"
+        )
+    if cell_meta.model_id not in model_ids:
+        return (
+            f"it serves model {cell_meta.model_id!r} and this run serves {sorted(model_ids)}, so no request of this "
+            f"run would ever reach it"
+        )
+    return None
+
+
+def _summarize_validation_error(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in one['loc'])}: {one['msg']}" for one in error.errors(include_url=False)
+    )
 
 
 def compute_nodes_per_engine(*, num_gpus_per_engine: int, num_gpus_per_node: int) -> int:

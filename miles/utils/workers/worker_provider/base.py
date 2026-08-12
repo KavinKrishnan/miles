@@ -40,6 +40,13 @@ class BaseWorkerProvider(abc.ABC):
     def expected_num_cells(self, *, model_id: str) -> int | None:
         return None
 
+    def extra_expected_num_cells(self, *, model_id: str) -> int:
+        """How many cells of ``model_id`` this provider expects on top of the ones this deployment launches."""
+        return 0
+
+    def invalidate_cell(self, cell_id: str) -> None:
+        return None
+
     def get_handle(self, worker_name: str) -> BaseWorkerHandle:
         (infos,) = self.get_worker_infos(cell_ids=[cell_id_of_worker(worker_name)])
         return select_handle(worker_name=worker_name, infos=infos)

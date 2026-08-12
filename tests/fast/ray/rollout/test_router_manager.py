@@ -7,6 +7,7 @@ import pytest
 from tests.fast.ray.rollout.conftest import make_args
 
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_router_ready, wait_session_server_ready
+from miles.ray.specs.inference import compute_router_worker_name
 from miles.utils.workers.worker_spec import HostAndPort, NamedHostAndPorts
 
 _TWO_MODEL_CONFIG = """\
@@ -33,8 +34,6 @@ def _make_two_model_args(tmp_path: Path) -> Namespace:
         sglang_config=str(config_path),
         rollout_num_gpus=12,
         num_gpus_per_node=8,
-        sglang_router_ip=None,
-        sglang_router_port=None,
         sglang_model_routers=None,
     )
 
@@ -42,68 +41,60 @@ def _make_two_model_args(tmp_path: Path) -> Namespace:
 _ROUTER_PROVIDERS = [object()]
 
 
+def _patch_wait_router_ready(monkeypatch, *, waited: list[str], providers: list[object] | None = None):
+    async def _fake_wait_router_ready(*, worker_name: str, provider) -> HostAndPort:
+        waited.append(worker_name)
+        if providers is not None:
+            providers.append(provider)
+        return HostAndPort(host="10.0.0.9", port=30000 + len(waited) - 1)
+
+    monkeypatch.setattr("miles.ray.rollout.router_manager.wait_router_ready", _fake_wait_router_ready)
+
+
 class TestResolveRouterAddrs:
     async def test_records_every_models_router_on_args(self, monkeypatch):
-        """The driver-visible router contract (primary ip/port, per-model map) is written exactly once, here."""
-        args = make_args(sglang_router_ip=None, sglang_router_port=None, sglang_model_routers=None)
-
-        async def _fake_wait_router_ready(*, model_idx: int, provider) -> HostAndPort:
-            return HostAndPort(host="10.0.0.9", port=30000 + model_idx)
-
-        monkeypatch.setattr("miles.ray.rollout.router_manager.wait_router_ready", _fake_wait_router_ready)
+        """The driver-visible router contract (the per-model map) is written exactly once, here."""
+        args = make_args(sglang_model_routers=None)
+        _patch_wait_router_ready(monkeypatch, waited=[])
 
         router_addrs = await resolve_router_addrs(args, router_providers=_ROUTER_PROVIDERS)
 
         assert router_addrs == {"default": HostAndPort(host="10.0.0.9", port=30000)}
-        assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.9", 30000)
         assert args.sglang_model_routers == {"default": ("10.0.0.9", 30000)}
 
     async def test_resolving_again_in_the_same_process_answers_from_the_record(self, monkeypatch):
         """The driver and an in-process controller may both resolve; the second call must not re-wait."""
-        args = make_args(sglang_router_ip=None, sglang_router_port=None, sglang_model_routers=None)
-        waited: list[int] = []
-
-        async def _fake_wait_router_ready(*, model_idx: int, provider) -> HostAndPort:
-            waited.append(model_idx)
-            return HostAndPort(host="10.0.0.9", port=30000 + model_idx)
-
-        monkeypatch.setattr("miles.ray.rollout.router_manager.wait_router_ready", _fake_wait_router_ready)
+        args = make_args(sglang_model_routers=None)
+        waited: list[str] = []
+        _patch_wait_router_ready(monkeypatch, waited=waited)
 
         first = await resolve_router_addrs(args, router_providers=_ROUTER_PROVIDERS)
         second = await resolve_router_addrs(args, router_providers=_ROUTER_PROVIDERS)
 
         assert second == first
-        assert waited == [0]
+        assert waited == [compute_router_worker_name(0)]
 
     async def test_every_model_gets_its_own_router_and_model_zero_is_the_primary(self, monkeypatch, tmp_path: Path):
-        """Each model has its own router, and the driver-wide ip/port must be the first model's, not the last."""
+        """Each model has its own router, and every model's address lands in the per-model map."""
         args = _make_two_model_args(tmp_path)
-        waited: list[int] = []
-
+        waited: list[str] = []
         providers: list[object] = []
         two_model_providers = [object(), object()]
-
-        async def _fake_wait_router_ready(*, model_idx: int, provider) -> HostAndPort:
-            waited.append(model_idx)
-            providers.append(provider)
-            return HostAndPort(host="10.0.0.9", port=30000 + model_idx)
-
-        monkeypatch.setattr("miles.ray.rollout.router_manager.wait_router_ready", _fake_wait_router_ready)
+        _patch_wait_router_ready(monkeypatch, waited=waited, providers=providers)
 
         router_addrs = await resolve_router_addrs(args, router_providers=two_model_providers)
 
-        assert waited == [0, 1]
+        assert waited == [compute_router_worker_name(0), compute_router_worker_name(1)]
         assert providers == two_model_providers
         assert router_addrs == {
             "actor": HostAndPort(host="10.0.0.9", port=30000),
             "ref": HostAndPort(host="10.0.0.9", port=30001),
         }
         assert args.sglang_model_routers == {"actor": ("10.0.0.9", 30000), "ref": ("10.0.0.9", 30001)}
-        assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.9", 30000)
 
     async def test_an_externally_configured_router_is_rejected(self):
-        """External router mode was removed, so a pre-set router address means a misconfigured run."""
-        args = make_args(sglang_router_ip="10.0.0.1", sglang_router_port=3000, sglang_model_routers=None)
+        """External router mode was removed, so an empty pre-set router map means a misconfigured run."""
+        args = make_args(sglang_model_routers={})
 
         with pytest.raises(AssertionError, match="external router mode was removed"):
             await resolve_router_addrs(args, router_providers=_ROUTER_PROVIDERS)
@@ -134,7 +125,7 @@ class TestWaitRouterReady:
             lambda host, port, timeout: waited.append((host, port)),
         )
 
-        addr = await wait_router_ready(model_idx=1, provider=_FakeProvider())
+        addr = await wait_router_ready(worker_name=compute_router_worker_name(1), provider=_FakeProvider())
 
         assert requested == ["inference-router-1-0-0"]
         assert waited == [("10.0.0.9", 12345)]

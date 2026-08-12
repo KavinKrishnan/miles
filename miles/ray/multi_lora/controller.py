@@ -9,6 +9,7 @@ from miles.ray.multi_lora.backend import MultiLoRABackend
 from miles.ray.multi_lora.http_server import MultiLoRAHTTPServer
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.specs.multi_lora import create_multi_lora_controller_handle
+from miles.rollout.router_addressing import compute_router_url
 from miles.utils.adapter_config import AdapterRun
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.function_registry import load_function
@@ -75,7 +76,7 @@ class MultiLoRAController(NodeProbeMixin):
     async def init(self) -> int:
         args = self.args
         await resolve_router_addrs(args, router_providers=self._router_providers)
-        router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+        router_url = compute_router_url(args)
 
         backend_cls = _load_subclass(getattr(args, "multi_lora_backend_path", None), MultiLoRABackend)
         server_cls = _load_subclass(getattr(args, "multi_lora_http_server_path", None), MultiLoRAHTTPServer)

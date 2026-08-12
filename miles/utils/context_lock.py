@@ -122,6 +122,12 @@ class ContextLock:
             logger.info(f"Still waiting for lock {self._name!r} after {time.monotonic() - wait_start_time:.0f}s")
 
 
+def compute_context_without_lock_grant() -> contextvars.Context:
+    context = contextvars.copy_context()
+    context.run(_held_lock.set, None)
+    return context
+
+
 def enforce_lock_discipline(cls: type) -> type:
     for member_name, member in vars(cls).items():
         if member_name in _ANNOTATION_MEMBER_NAMES:

@@ -10,7 +10,7 @@ from miles.backends.sglang_utils.sglang_config import (
     _compute_rollout_offset,
     resolve_sglang_config,
 )
-from miles.ray.rollout.cell_state import CellAddrInfo, StateServing
+from miles.ray.rollout.cell_state import CellAddrInfo, StateDisposed, StateServing
 from miles.ray.rollout.rollout_server import RolloutServer
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
 from miles.utils.context_lock import ContextLock
@@ -252,7 +252,7 @@ class TestEngineListOrdering:
             assert srv.engine_gpu_counts == [i + 1 for i in range(12)]
 
 
-class TestAddCellRollback:
+class TestBringUpCellRollback:
     def _make_meta(self) -> ServerCellMetadata:
         return ServerCellMetadata(
             model_id="default",
@@ -268,8 +268,8 @@ class TestAddCellRollback:
         )
 
     @pytest.mark.asyncio
-    async def test_a_failed_add_still_tracks_the_cell_so_nothing_leaks(self, monkeypatch):
-        """The cell is committed before init runs, so a failing init cannot orphan its health checker task."""
+    async def test_a_failed_add_leaves_no_half_added_cell_behind(self, monkeypatch):
+        """A cell that never initialized is invisible to every sweep, so the add rolls it back itself."""
         srv = RolloutServer(
             server_cells={},
             args=SimpleNamespace(colocate=False, ft_components=[]),
@@ -280,10 +280,46 @@ class TestAddCellRollback:
 
         async with srv.context_lock:
             with pytest.raises(RuntimeError, match="injected init failure"):
-                await srv.add_cell(self._make_meta())
+                srv.commit_cell(await srv.bring_up_cell(self._make_meta()))
+
+            assert srv.server_cells == {}
+
+    @pytest.mark.asyncio
+    async def test_the_cell_a_failed_add_rolled_back_can_be_added_again(self, monkeypatch):
+        """The next snapshot announces it once more, and a leftover entry would make that a no-op forever."""
+        srv = RolloutServer(
+            server_cells={},
+            args=SimpleNamespace(colocate=False, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
+        )
+        monkeypatch.setattr(ServerCell, "init", _raise_async)
+
+        async with srv.context_lock:
+            with pytest.raises(RuntimeError, match="injected init failure"):
+                srv.commit_cell(await srv.bring_up_cell(self._make_meta()))
+            monkeypatch.setattr(ServerCell, "init", _noop_async)
+            srv.commit_cell(await srv.bring_up_cell(self._make_meta()))
 
             assert list(srv.server_cells) == ["inference-engine-0-0-0"]
             await srv.dispose()
+
+    @pytest.mark.asyncio
+    async def test_a_bring_up_whose_own_cleanup_fails_still_raises_what_went_wrong(self, monkeypatch):
+        """Only the init error says why the cell never came up; the cleanup error would hide it."""
+        srv = RolloutServer(
+            server_cells={},
+            args=SimpleNamespace(colocate=False, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
+        )
+        monkeypatch.setattr(ServerCell, "init", _raise_async)
+        monkeypatch.setattr(ServerCell, "dispose", _dispose_badly_async)
+
+        with pytest.raises(RuntimeError, match="injected init failure"):
+            await srv.bring_up_cell(self._make_meta())
+
+        assert srv.server_cells == {}
 
     @pytest.mark.asyncio
     async def test_disposing_the_server_removes_every_cell_it_tracks(self, monkeypatch):
@@ -297,7 +333,7 @@ class TestAddCellRollback:
         monkeypatch.setattr(ServerCell, "init", _noop_async)
 
         async with srv.context_lock:
-            await srv.add_cell(self._make_meta())
+            srv.commit_cell(await srv.bring_up_cell(self._make_meta()))
             await srv.dispose()
 
         assert srv.server_cells == {}
@@ -314,7 +350,7 @@ class TestAddCellRollback:
         monkeypatch.setattr(ServerCell, "init", _noop_async)
 
         async with srv.context_lock:
-            await srv.add_cell(self._make_meta())
+            srv.commit_cell(await srv.bring_up_cell(self._make_meta()))
 
             assert list(srv.server_cells) == ["inference-engine-0-0-0"]
             await srv.dispose()
@@ -338,7 +374,7 @@ class TestAddCellInitTiming:
         monkeypatch.setattr(ServerCell, "init", _record)
 
         async with srv.context_lock:
-            await srv.add_cell(TestAddCellRollback()._make_meta())
+            srv.commit_cell(await srv.bring_up_cell(TestBringUpCellRollback()._make_meta()))
             await srv.dispose()
 
         assert initialized == ["inference-engine-0-0-0"]
@@ -360,7 +396,7 @@ class TestAddCellInitTiming:
         monkeypatch.setattr(ServerCell, "init", _record)
 
         async with srv.context_lock:
-            await srv.add_cell(TestAddCellRollback()._make_meta())
+            srv.commit_cell(await srv.bring_up_cell(TestBringUpCellRollback()._make_meta()))
 
             assert initialized == []
             assert list(srv.server_cells) == ["inference-engine-0-0-0"]
@@ -384,20 +420,19 @@ async def _make_serving_server(monkeypatch, *, num_cells: int) -> RolloutServer:
     )
     async with srv.context_lock:
         for cell_index in range(num_cells):
-            await srv.add_cell(
-                ServerCellMetadata(
-                    model_id="default",
-                    worker_type="regular",
-                    cell_id=f"default-{cell_index}",
-                    num_gpus_per_engine=1,
-                    gpu_offset=cell_index,
-                    sglang_api_key=None,
-                    worker_name=f"default-{cell_index}-0",
-                    needs_offload=False,
-                    update_weights=True,
-                    workers_hash=f"pseudo-hash-{cell_index}",
-                )
+            cell_meta = ServerCellMetadata(
+                model_id="default",
+                worker_type="regular",
+                cell_id=f"default-{cell_index}",
+                num_gpus_per_engine=1,
+                gpu_offset=cell_index,
+                sglang_api_key=None,
+                worker_name=f"default-{cell_index}-0",
+                needs_offload=False,
+                update_weights=True,
+                workers_hash=f"pseudo-hash-{cell_index}",
             )
+            srv.commit_cell(await srv.bring_up_cell(cell_meta))
             cell = srv.server_cells[f"default-{cell_index}"]
             addr_info = CellAddrInfo(
                 server_url=f"http://10.0.0.{cell_index + 1}:3000{cell_index}", bootstrap_port=None, gate_url=None
@@ -420,6 +455,11 @@ class _RecordingRouterApiClient:
 
 def _make_lock() -> ContextLock:
     return ContextLock("InferenceController")
+
+
+async def _dispose_badly_async(self):
+    self._state = StateDisposed()
+    raise RuntimeError("injected dispose failure")
 
 
 async def _raise_async(self):

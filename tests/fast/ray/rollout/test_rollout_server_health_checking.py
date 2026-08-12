@@ -147,7 +147,7 @@ class TestAddCellHealthChecker:
         srv = _make_server()
 
         async with srv.context_lock:
-            await srv.add_cell(_make_meta())
+            srv.commit_cell(await srv.bring_up_cell(_make_meta()))
 
             checker = srv.server_cells["cell-0"]._health_checker
             assert isinstance(checker, SimpleHealthChecker)
@@ -159,7 +159,7 @@ class TestAddCellHealthChecker:
         srv = _make_server(global_health_checker_activeness=lambda: ActiveAndEpoch(active=False, epoch=0))
 
         async with srv.context_lock:
-            await srv.add_cell(_make_meta())
+            srv.commit_cell(await srv.bring_up_cell(_make_meta()))
 
             assert not srv.server_cells["cell-0"]._get_health_checker_active_and_epoch().active
             await srv.dispose()
@@ -169,7 +169,7 @@ class TestAddCellHealthChecker:
         srv = _make_server(ft_components=())
 
         async with srv.context_lock:
-            await srv.add_cell(_make_meta())
+            srv.commit_cell(await srv.bring_up_cell(_make_meta()))
 
             assert isinstance(srv.server_cells["cell-0"]._health_checker, NoopHealthChecker)
             await srv.dispose()

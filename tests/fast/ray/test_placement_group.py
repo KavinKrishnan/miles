@@ -19,8 +19,7 @@ def _make_args(**overrides) -> Namespace:
         pin_rollout_manager_to_head=False,
         num_rollout=None,
         num_epoch=2,
-        sglang_router_ip=None,
-        sglang_router_port=None,
+        sglang_model_routers=None,
         cluster_backend="ray",
         deploy_component="all",
         trainer_controller_addrs=None,
@@ -41,8 +40,7 @@ def fake_components():
     controller_handle.get_eval_fleet = AsyncMock(return_value=None)
 
     async def resolve_router_addrs(args, *, router_providers) -> dict:
-        args.sglang_router_ip = "10.0.0.1"
-        args.sglang_router_port = 4321
+        args.sglang_model_routers = {"default": ("10.0.0.1", 4321)}
         return {}
 
     events: list[str] = []
@@ -112,7 +110,7 @@ class TestCreateRolloutComponents:
 
         await create_rollout_components(args)
 
-        assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.1", 4321)
+        assert args.sglang_model_routers == {"default": ("10.0.0.1", 4321)}
 
     async def test_num_rollout_derived_from_executor_epoch_length(self, fake_components):
         """num_rollout comes from the dataset, which the executor owns."""
@@ -160,7 +158,7 @@ class TestCreateRolloutComponents:
         await create_rollout_components(args)
 
         assert fake_components.capability.requested_static_pool_ids == []
-        assert args.sglang_router_ip is None
+        assert args.sglang_model_routers is None
 
 
 class TestCreatePlacementGroups:
@@ -168,10 +166,15 @@ class TestCreatePlacementGroups:
     def _args(**overrides) -> Namespace:
         defaults = dict(
             deploy_component="all",
+            megatron_config=None,
             debug_train_only=False,
             debug_rollout_only=False,
             rollout_external=False,
             colocate=False,
+            kl_coef=0,
+            use_kl_loss=False,
+            use_opd=False,
+            opd_type="megatron",
             use_critic=True,
             actor_num_nodes=1,
             actor_num_gpus_per_node=2,
@@ -242,7 +245,7 @@ class TestUpdateWeights:
         actor_model.update_weights = AsyncMock(side_effect=_update_weights)
 
         rollout_executor = MagicMock()
-        rollout_executor.set_weight_version.remote = AsyncMock()
+        rollout_executor.set_weight_version = AsyncMock()
 
         inference_controller = MagicMock()
         inference_controller.start_update_weights = AsyncMock(
@@ -274,8 +277,27 @@ class TestUpdateWeights:
             rollout_id=3,
         )
 
-        fakes.actor_model.update_weights.assert_awaited_once_with(info=fakes.info, rollout_id=3)
-        fakes.rollout_executor.set_weight_version.remote.assert_awaited_once_with(7, trainer_model_id=None)
+        fakes.actor_model.update_weights.assert_awaited_once_with(info=fakes.info, rollout_id=3, model_id=None)
+        fakes.rollout_executor.set_weight_version.assert_awaited_once_with(7, trainer_model_id=None)
+
+    async def test_a_multi_policy_update_names_its_policy_at_every_hop(self):
+        """One policy's update must not touch another's engines or stamp another's samples."""
+        from miles.ray.placement_group import update_weights
+
+        fakes = self._fakes(weight_version=7)
+
+        await update_weights(
+            _make_args(debug_rollout_only=False),
+            actor_model=fakes.actor_model,
+            rollout_executor=fakes.rollout_executor,
+            inference_controller=fakes.inference_controller,
+            rollout_id=3,
+            model_id="alpha",
+        )
+
+        fakes.inference_controller.start_update_weights.assert_awaited_once_with(model_id="alpha")
+        fakes.actor_model.update_weights.assert_awaited_once_with(info=fakes.info, rollout_id=3, model_id="alpha")
+        fakes.rollout_executor.set_weight_version.assert_awaited_once_with(7, trainer_model_id="alpha")
 
     async def test_a_trainer_that_skipped_the_broadcast_publishes_nothing(self):
         """--debug-skip-weight-update leaves the engines on their old weights, so the version must not move."""
@@ -290,7 +312,7 @@ class TestUpdateWeights:
             inference_controller=fakes.inference_controller,
         )
 
-        fakes.rollout_executor.set_weight_version.remote.assert_not_awaited()
+        fakes.rollout_executor.set_weight_version.assert_not_awaited()
 
     async def test_the_orchestration_script_brackets_the_broadcast_with_the_update_window(self):
         """The star topology puts the sequencing here: the trainer never calls the inference controller."""

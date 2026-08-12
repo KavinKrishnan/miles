@@ -24,6 +24,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+from miles.rollout.router_addressing import compute_any_router_url
 from miles.utils import object_store
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
@@ -57,6 +58,7 @@ class RolloutExecutor(NodeProbeMixin):
         *,
         args,
         router_providers: Sequence[BaseWorkerProvider],
+        router_worker_names: Sequence[str] | None = None,
         session_server_provider: BaseWorkerProvider | None,
         inference_controller_provider: BaseWorkerProvider,
     ):
@@ -70,17 +72,20 @@ class RolloutExecutor(NodeProbeMixin):
         self._rollout_ids: dict[str | None, int] = {}
         self._multi_policy = resolve_megatron_config(args).is_multi_policy
         self._router_providers = router_providers
+        self._router_worker_names = router_worker_names
         self._session_server_provider = session_server_provider
         self._inference_controller_provider = inference_controller_provider
 
     async def init(self) -> None:
         args = self.args
         if not args.debug_train_only:
-            await resolve_router_addrs(args, router_providers=self._router_providers)
+            await resolve_router_addrs(
+                args, router_providers=self._router_providers, router_worker_names=self._router_worker_names
+            )
             await wait_session_server_ready(args, provider=self._session_server_provider)
 
         # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+        init_tracking(args, primary=False, router_addr=compute_any_router_url(args))
         object_store.init_instance(args, contribute_segment=False)
 
         if not self.args.debug_train_only:
@@ -145,7 +150,14 @@ class RolloutExecutor(NodeProbeMixin):
             except EmptyBatchTimeoutError as e:
                 logger.warning(f"Rollout {rollout_id} produced no trainable group before the empty-wait timeout: {e}")
                 return dict(sample_indices=None, data_ref=None, empty_batch_timeout=True)
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
+        save_debug_rollout_data(
+            self.args,
+            data,
+            rollout_id=rollout_id,
+            evaluation=False,
+            metadata=metadata,
+            trainer_model_id=trainer_model_id,
+        )
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=metric_model_id
         )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from pathlib import Path
 
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_provider.kubernetes.helm.naming import CHART_NAME, component_name
 
 ORCHESTRATOR_COMPONENT = "orchestrator"
@@ -21,10 +22,23 @@ _STATE_FILE_GLOB = "orchestrator-*.state"
 
 class RunNames:
     @staticmethod
-    def release(*, run_id: str, deploy_component: DeployComponent = DeployComponent.ALL) -> str:
+    def release(
+        *,
+        run_id: str,
+        deploy_component: DeployComponent = DeployComponent.ALL,
+        deploy_instance: str | None = None,
+    ) -> str:
         if deploy_component is DeployComponent.ALL:
+            assert deploy_instance is None, "`all` deploys the whole run, so no instance of it is named"
             return f"{CHART_NAME}-{run_id}"
-        return f"{CHART_NAME}-{run_id}-{deploy_component.value}"
+        suffix = deploy_component.value
+        if deploy_instance is not None:
+            suffix = f"{suffix}-{sanitize_release_instance(deploy_instance)}"
+        return f"{CHART_NAME}-{run_id}-{suffix}"
+
+    @staticmethod
+    def release_of(*, run_id: str, selector: DeploySelector) -> str:
+        return RunNames.release(run_id=run_id, deploy_component=selector.component, deploy_instance=selector.instance)
 
     @staticmethod
     def service_fqdn(*, name: str, namespace: str) -> str:
@@ -73,3 +87,15 @@ def _orchestrator_state_path(run_directory: str | Path, launch_token: str) -> Pa
 
 def _new_launch_token() -> str:
     return f"{time.strftime('%y%m%d-%H%M%S')}-{random.Random().randint(0, 999999):06d}"
+
+
+def sanitize_release_instance(instance: str) -> str:
+    sanitized = _INSTANCE_ILLEGAL_PATTERN.sub("-", instance.lower()).strip("-")
+    assert sanitized, (
+        f"the instance {instance!r} names every object its release installs, so it has to hold at least one "
+        f"letter or digit"
+    )
+    return sanitized
+
+
+_INSTANCE_ILLEGAL_PATTERN = re.compile(r"[^a-z0-9]+")

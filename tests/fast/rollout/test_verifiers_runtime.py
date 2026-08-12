@@ -27,10 +27,8 @@ def _args(**overrides):
         "rollout_skip_special_tokens": True,
         "rollout_stop": None,
         "rollout_stop_token_ids": None,
-        "sglang_model_routers": None,
-        "sglang_router_ip": "127.0.0.1",
+        "sglang_model_routers": {"default": ("127.0.0.1", 30000)},
         "sglang_router_policy": "round_robin",
-        "sglang_router_port": 30000,
         "sglang_tokenizer_path": None,
     }
     values.update(overrides)

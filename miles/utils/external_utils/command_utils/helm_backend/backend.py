@@ -46,10 +46,10 @@ class KubernetesCommandBackend(BaseCommandBackend):
             "release; set ExecuteTrainConfig.run_id and .namespace before asking where that pod is"
         )
         assert self.config.deploy_component.deploys_orchestration_script(), (
-            f"The api server runs beside the orchestration script, which the {self.config.deploy_component.value} "
+            f"The api server runs beside the orchestration script, which the {self.config.deploy_selector.value} "
             f"deployment does not carry; ask the deployment that does"
         )
         return RunNames.orchestrator_host(
-            release=RunNames.release(run_id=self.config.run_id, deploy_component=self.config.deploy_component),
+            release=RunNames.release_of(run_id=self.config.run_id, selector=self.config.deploy_selector),
             namespace=self.config.namespace,
         )

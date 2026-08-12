@@ -13,13 +13,13 @@ from miles.ray.specs.inference import (
     create_inference_controller_handle,
 )
 from miles.ray.specs.rollout import create_rollout_executor_handle
-from miles.ray.specs.train import compute_critic_args, create_trainer_controller_handle
+from miles.ray.specs.train import compute_critic_args, compute_trainer_gpu_budget, create_trainer_controller_handle
 from miles.ray.wiring import get_backend_capability
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import InferenceEngineWeightChecksumEvent
 from miles.utils.ft_utils.api_server.server import start_api_server
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 
 logger = logging.getLogger(__name__)
@@ -100,9 +100,9 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
-    actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    actor_num_gpus = compute_trainer_gpu_budget(args)
 
-    component = DeployComponent(args.deploy_component)
+    component = DeploySelector.of(args).component
     if component is DeployComponent.PRIMARY:
         return 0, 0
     if component is DeployComponent.TRAINER:
@@ -173,7 +173,7 @@ async def create_training_models(
 async def update_weights(
     args,
     *,
-    actor_model: BaseWorkerHandle,
+    actor_model,
     rollout_executor: BaseWorkerHandle,
     inference_controller: BaseWorkerHandle,
     rollout_id: int | None = None,
@@ -182,7 +182,7 @@ async def update_weights(
     """Sequence the weight update: the controllers never call each other, the orchestration script does."""
     info = await inference_controller.start_update_weights(model_id=model_id)
     try:
-        weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id)
+        weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id, model_id=model_id)
     except BaseException:
         await inference_controller.abort_update_weights()
         raise
@@ -212,7 +212,7 @@ async def _maybe_log_inference_engine_weight_checksums(
 
 
 # TODO: move (when reorganizing files)
-def maybe_start_api_server(args, *, actor_model: BaseWorkerHandle, inference_controller: BaseWorkerHandle) -> None:
+def maybe_start_api_server(args, *, actor_model, inference_controller: BaseWorkerHandle) -> None:
     if not args.api_server_port:
         return
 

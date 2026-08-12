@@ -7,6 +7,7 @@ import ray
 from tests.fast.ray.train.fake_worker_manager import FakeWorkerManager
 
 import miles.ray.train.group as group_module
+from miles.ray.specs.trainer_identity import DEFAULT_TRAINER_ROLE, compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
 from miles.utils.ft_utils.health_checker import NoopHealthChecker
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
@@ -49,8 +50,8 @@ def instant_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(group_module, "retry", _retry_without_sleeping)
 
 
-def make_provider() -> BaseWorkerProvider:
-    return RayWorkerProvider(worker_manager_handle=fake_worker_manager)
+def make_provider(*, role: str = DEFAULT_TRAINER_ROLE) -> BaseWorkerProvider:
+    return RayWorkerProvider(worker_manager_handle=fake_worker_manager, pool_ids=[compute_trainer_pool_id(role)])
 
 
 def get_raw_actor_handles(cell: TrainerCell) -> list[ray.actor.ActorHandle]:
@@ -83,9 +84,9 @@ def make_cell(
     fake_worker_manager.actor_count_per_cell = actor_count
     return TrainerCell(
         args=MagicMock(),
-        role="actor",
+        role=DEFAULT_TRAINER_ROLE,
         with_ref=False,
-        cell_id=f"trainer-engine-actor-{cell_index}",
+        cell_id=f"{compute_trainer_pool_id(DEFAULT_TRAINER_ROLE)}-{cell_index}",
         cell_index=cell_index,
         workers_hash="pseudo-hash-1",
         health_checker=NoopHealthChecker(),

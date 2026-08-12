@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from tests.fast.ray.train.conftest import make_provider
 
-from miles.ray.specs.train import compute_trainer_pool_id
+from miles.ray.specs.trainer_identity import DEFAULT_TRAINER_ROLE, compute_trainer_pool_id
 from miles.ray.train.group import TrainerController
 from miles.utils import retry_utils
 from miles.utils.ft_utils.health_checker import ActivenessTracker
@@ -12,7 +12,7 @@ from miles.utils.workers.worker_provider.base import CellInfo
 
 pytestmark = pytest.mark.asyncio
 
-_POOL_ID = compute_trainer_pool_id("actor")
+_POOL_ID = compute_trainer_pool_id(DEFAULT_TRAINER_ROLE)
 
 
 def _make_controller(*, num_cells: int = 2, indep_dp: bool = False) -> TrainerController:
@@ -26,7 +26,7 @@ def _make_controller(*, num_cells: int = 2, indep_dp: bool = False) -> TrainerCo
         context_parallel_size=1,
         train_backend="megatron",
     )
-    group._role = "actor"
+    group._role = DEFAULT_TRAINER_ROLE
     group._with_ref = False
     group._with_opd_teacher = False
     group._pool_id = _POOL_ID

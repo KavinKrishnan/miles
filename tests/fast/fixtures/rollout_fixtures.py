@@ -69,8 +69,6 @@ def _build_args(*, data_path: str, router_port: int, extra_argv: list[str] | Non
         "toy",
         data_path,
         "--use-miles-router",
-        "--sglang-router-ip",
-        "127.0.0.1",
         "--sglang-router-port",
         str(router_port),
         "--rollout-max-response-len",
@@ -78,13 +76,15 @@ def _build_args(*, data_path: str, router_port: int, extra_argv: list[str] | Non
     ] + (extra_argv or [])
     with patch("sys.argv", argv):
         args = parse_args()
+    args.sglang_model_routers = {"default": ("127.0.0.1", router_port)}
     init_http_client(args)
     return args
 
 
 @contextmanager
 def _with_miles_router(args: Namespace) -> Iterator[UvicornThreadServer]:
-    config = compute_miles_router_config(args, host=args.sglang_router_ip, port=args.sglang_router_port)
+    host, port = next(iter(args.sglang_model_routers.values()))
+    config = compute_miles_router_config(args, host=host, port=port)
     router = MilesRouter(config, verbose=False)
     server = UvicornThreadServer(router.app, host=config.host, port=config.port)
     try:

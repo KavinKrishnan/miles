@@ -12,7 +12,8 @@ from tests.fast.utils.workers.worker_provider.kubernetes.core.test_pod_view impo
 
 from miles.ray import wiring
 from miles.ray.specs import train as specs_train
-from miles.ray.specs.train import compute_trainer_pool_id, specs_trainer
+from miles.ray.specs.train import specs_trainer
+from miles.ray.specs.trainer_identity import compute_trainer_pool_id
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import LaunchPlan
 from miles.utils.workers.reconcile.k8s_api import PodListPage
@@ -89,7 +90,13 @@ def engine_spec(*, num_cells: int = 2, gpu_offset: int = 0) -> CommandWorkerSpec
 
 def trainer_args(*, num_cells: int) -> SimpleNamespace:
     return SimpleNamespace(
+        deploy_component="all",
+        megatron_config=None,
         use_critic=False,
+        kl_coef=0,
+        use_kl_loss=False,
+        use_opd=False,
+        opd_type="megatron",
         actor_num_nodes=num_cells,
         actor_num_gpus_per_node=GPUS_PER_NODE,
         indep_dp=num_cells > 1,

@@ -5,6 +5,7 @@ import traceback
 from copy import deepcopy
 
 from miles.rollout.rm_hub import batched_async_rm
+from miles.rollout.router_addressing import compute_router_url
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
@@ -18,7 +19,7 @@ async def generate_response(args, prompt, key):
         max_context_length = args.rollout_max_context_len
         sample = deepcopy(args.sample)
 
-        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        url = compute_router_url(args, endpoint="/generate")
 
         sample.prompt = prompt
         prompt_token_ids = tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]

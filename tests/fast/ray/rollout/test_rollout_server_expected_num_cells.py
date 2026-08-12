@@ -246,13 +246,32 @@ class TestRouterFlagsAtStartup:
         args = _make_args_with_config(models=_CONFIG_SINGLE_GROUP, tmp_path=tmp_path)
         args.sglang_router_port = 31000
 
-        assert await _create_servers(args)
+        assert await _create_servers(args, _CONFIG_SINGLE_GROUP)
 
-    async def test_an_external_router_ip_is_still_rejected(self, tmp_path: Path) -> None:
-        """Attaching to a router miles did not start is not supported yet, and silently starting
-        one anyway would put two routers in front of the same engines."""
+
+class _ExpectingProvider(_StubProvider):
+    def __init__(self, *, extra_by_model: dict[str, int]) -> None:
+        self._extra_by_model = dict(extra_by_model)
+
+    def extra_expected_num_cells(self, *, model_id: str) -> int:
+        return self._extra_by_model[model_id]
+
+
+class TestBarrierCountsRegisteredCells:
+    async def test_the_barrier_waits_for_the_cells_other_deployments_declare(self, tmp_path: Path) -> None:
+        """A run whose remote engines never arrive would otherwise start against its local ones alone."""
         args = _make_args_with_config(models=_CONFIG_SINGLE_GROUP, tmp_path=tmp_path)
-        args.sglang_router_ip = "10.0.0.9"
+        servers = await _create_servers(args, _CONFIG_SINGLE_GROUP)
+        server = servers["actor"]
+        server.engine_provider = _ExpectingProvider(extra_by_model={"actor": 4})
 
-        with pytest.raises(AssertionError, match="external router mode was removed"):
-            await _create_servers(args)
+        assert server.total_expected_num_cells() == 12
+
+    async def test_a_run_nobody_registers_into_waits_only_for_its_own_cells(self, tmp_path: Path) -> None:
+        """Single-deployment runs must keep the barrier they always had."""
+        args = _make_args_with_config(models=_CONFIG_SINGLE_GROUP, tmp_path=tmp_path)
+        servers = await _create_servers(args, _CONFIG_SINGLE_GROUP)
+        server = servers["actor"]
+        server.engine_provider = _ExpectingProvider(extra_by_model={"actor": 0})
+
+        assert server.total_expected_num_cells() == 8

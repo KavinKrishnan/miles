@@ -38,6 +38,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
+from miles.rollout.router_addressing import compute_router_url
 from miles.utils.lora import LORA_ADAPTER_NAME, is_lora_enabled
 from miles.utils.types import Sample
 
@@ -219,12 +220,7 @@ def _train_client(
 
 
 def _generate_url(args: Namespace, endpoint: str = "/generate") -> str:
-    routers = getattr(args, "sglang_model_routers", None)
-    if routers and "default" in routers:
-        ip, port = routers["default"]
-    else:
-        ip, port = args.sglang_router_ip, args.sglang_router_port
-    return f"http://{ip}:{port}{endpoint}"
+    return compute_router_url(args, model_id="default", endpoint=endpoint)
 
 
 async def _sglang_worker_urls(args: Namespace) -> list[str]:

@@ -15,8 +15,6 @@ from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip, retarget_a
 
 def make_args(**overrides) -> Namespace:
     defaults = dict(
-        sglang_router_ip="10.0.0.1",
-        sglang_router_port=30000,
         sglang_router_policy=None,
         rollout_num_gpus=4,
         rollout_num_gpus_per_engine=2,
@@ -35,11 +33,11 @@ def test_retarget_args_swaps_router_and_sizing():
     args = make_args()
     eval_args = retarget_args(args, "10.0.0.9", 39000, num_gpus=2, num_gpus_per_engine=2)
 
-    assert (eval_args.sglang_router_ip, eval_args.sglang_router_port) == ("10.0.0.9", 39000)
+    assert eval_args.sglang_model_routers == {"default": ("10.0.0.9", 39000), "eval": ("10.0.0.9", 39000)}
     assert eval_args.rollout_num_gpus == 2
     assert eval_args.rollout_num_gpus_per_engine == 2
     # The original namespace is untouched.
-    assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.1", 30000)
+    assert args.sglang_model_routers == {"default": ("10.0.0.1", 30000), "eval": ("10.0.0.2", 31000)}
     assert args.rollout_num_gpus == 4
 
 
@@ -532,7 +530,7 @@ async def test_external_eval_fn_waits_pins_then_evals(external_fn_env):
     assert external_fn_env.calls[3][0] == "eval"
     # The eval state targets the external server, built from the real training args.
     state = external_fn_env.calls[3][1]
-    assert (state.args.sglang_router_ip, state.args.sglang_router_port) == ("eval-host", 31000)
+    assert state.args.sglang_model_routers == {"default": ("eval-host", 31000), "eval": ("eval-host", 31000)}
     assert output.data == {"ds": {"rewards": [1.0]}}
 
 

@@ -13,6 +13,7 @@ from miles.utils.external_utils.command_utils.ray_backend import command as ray_
 from miles.utils.external_utils.command_utils.ray_backend.backend import RayCommandBackend
 from miles.utils.external_utils.model_args_utils import load_model_args
 from miles.utils.file_arg_utils import resolve_file_arg
+from miles.utils.workers.types import DeployComponent
 
 
 def _backend():
@@ -43,6 +44,19 @@ class TestExecuteTrainConfig:
 
         monkeypatch.delenv("SLURM_JOB_NUM_NODES")
         assert command_utils.ExecuteTrainConfig().num_nodes == 1
+
+    def test_the_deploy_selector_defaults_to_the_whole_run(self):
+        """A launch that names no component installs one deployment covering every worker."""
+        selector = command_utils.ExecuteTrainConfig().deploy_selector
+
+        assert selector.component is DeployComponent.ALL
+        assert selector.instance is None
+
+    def test_the_deploy_selector_carries_the_instance_the_launch_deploys(self):
+        """The instance is what tells two trainer deployments of one run apart."""
+        config = command_utils.ExecuteTrainConfig(deploy_component=DeployComponent.TRAINER, deploy_instance="policy_a")
+
+        assert config.deploy_selector.value == "trainer:policy_a"
 
 
 class TestConvertCheckpoint:

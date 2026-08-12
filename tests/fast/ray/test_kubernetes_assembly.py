@@ -17,6 +17,7 @@ from miles.ray.specs import inference as specs_inference
 from miles.ray.specs import rollout as specs_rollout
 from miles.ray.specs import train as specs_train
 from miles.ray.specs.train import POOL_CATEGORY_TRAINER_ENGINE
+from miles.ray.specs.trainer_identity import compute_trainer_controller_pool_id
 from miles.ray.train.cell import TrainerCell
 from miles.utils import http_utils
 from miles.utils.ft_utils.api_server.models import CellStatus
@@ -233,6 +234,9 @@ def rollout_executor_args() -> SimpleNamespace:
         inference_router_addrs=None,
         pin_rollout_manager_to_head=False,
         debug_train_only=True,
+        megatron_config=None,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=1,
         use_critic=False,
         kl_coef=0,
         use_kl_loss=False,
@@ -265,8 +269,8 @@ def install(monkeypatch: pytest.MonkeyPatch, *, pods: list[Pod], workers_per_pod
     specs = [
         trainer_spec(num_workers_per_cell=len(pods) * workers_per_pod, num_gpus_per_node=workers_per_pod),
         specs_rollout.spec_rollout_executor(rollout_executor_args()),
-        specs_inference.spec_inference_controller(rollout_executor_args()),
-        specs_train.spec_trainer_controller_actor(rollout_executor_args()),
+        *specs_inference.specs_inference_controller(rollout_executor_args()),
+        *specs_train.specs_trainer_controller(rollout_executor_args()),
     ]
     return compute_helm_backend_capability(specs=specs)
 
@@ -470,7 +474,7 @@ class TestKubernetesDriverAssembly:
         capability = install(monkeypatch, pods=cell_pods(2))
 
         controller = FakeTrainerController()
-        host = STATIC_HOSTS[specs_train.compute_trainer_controller_pool_id("actor")]
+        host = STATIC_HOSTS[compute_trainer_controller_pool_id("actor")]
         app = create_rpc_app(controller)
         transport = _PerHostTransport({host: app})
 

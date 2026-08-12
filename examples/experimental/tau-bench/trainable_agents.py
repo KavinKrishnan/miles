@@ -10,6 +10,7 @@ from tau_bench.agents.tool_calling_agent import RESPOND_ACTION_NAME, ToolCalling
 from tau_bench.types import Action, RunConfig
 from transformers import AutoTokenizer
 
+from miles.rollout.router_addressing import compute_router_url
 from miles.rollout.sglang_rollout import GenerateState
 from miles.utils.http_utils import post
 
@@ -200,7 +201,7 @@ class TrainableAgentMixin:
         """
         # Initialize environment and state
         state = GenerateState(rollout_args)
-        url = f"http://{rollout_args.sglang_router_ip}:" f"{rollout_args.sglang_router_port}/generate"
+        url = compute_router_url(rollout_args, endpoint="/generate")
 
         # Get initial environment state
         obs, info = self._initialize_environment(env, task_index)
@@ -439,8 +440,7 @@ class TrainableToolCallingAgent(ToolCallingAgent, TrainableAgentMixin):
 
         # Store rollout and sampling parameters as instance variables
         self.rollout_args = rollout_args or {
-            "sglang_router_ip": "127.0.0.1",
-            "sglang_router_port": 30000,
+            "sglang_model_routers": {"default": ("127.0.0.1", 30000)},
             "use_http2": False,
         }
         self.sampling_params = sampling_params or {

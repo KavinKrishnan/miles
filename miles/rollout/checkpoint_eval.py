@@ -40,8 +40,8 @@ def retarget_args(args: Namespace, router_ip, router_port, num_gpus: int, num_gp
     against a different set of engines unchanged.
     """
     eval_args = copy.copy(args)
-    eval_args.sglang_router_ip = router_ip
-    eval_args.sglang_router_port = router_port
+    router_names = list(args.sglang_model_routers or ["default"])
+    eval_args.sglang_model_routers = {name: (router_ip, router_port) for name in router_names}
     eval_args.rollout_num_gpus = num_gpus
     eval_args.rollout_num_gpus_per_engine = num_gpus_per_engine
     return eval_args

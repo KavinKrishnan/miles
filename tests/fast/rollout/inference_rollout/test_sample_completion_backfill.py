@@ -29,8 +29,7 @@ def make_args(**overrides) -> Namespace:
         dynamic_sampling_filter_path=None,
         rollout_sample_filter_path=None,
         rollout_all_samples_process_path=None,
-        sglang_router_ip="127.0.0.1",
-        sglang_router_port=30000,
+        sglang_model_routers={"default": ("127.0.0.1", 30000)},
     )
     defaults.update(overrides)
     return Namespace(**defaults)

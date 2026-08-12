@@ -12,8 +12,7 @@ pytestmark = pytest.mark.asyncio
 
 def _make_args(**overrides) -> SimpleNamespace:
     args = SimpleNamespace(
-        sglang_router_ip=None,
-        sglang_router_port=None,
+        sglang_model_routers=None,
         multi_lora_backend_path=None,
         multi_lora_http_server_path=None,
         multi_lora_api_port=0,
@@ -29,8 +28,7 @@ def events(monkeypatch) -> list[str]:
 
     async def fake_resolve_router_addrs(args, *, router_providers):
         recorded.append("resolve_router_addrs")
-        args.sglang_router_ip = "10.0.0.1"
-        args.sglang_router_port = 4321
+        args.sglang_model_routers = {"default": ("10.0.0.1", 4321)}
 
     class _Backend:
         def __init__(self, args, router_url):
@@ -75,7 +73,7 @@ class TestInit:
             "backend.init",
             "server.start",
         ]
-        assert args.sglang_router_ip == "10.0.0.1"
+        assert args.sglang_model_routers == {"default": ("10.0.0.1", 4321)}
 
     async def test_it_answers_the_port_the_server_actually_bound(self, events):
         """--multi-lora-api-port 0 asks the os for a port, so the caller can only learn it from the server."""

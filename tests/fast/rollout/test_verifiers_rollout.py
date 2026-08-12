@@ -42,10 +42,8 @@ def _args(**overrides) -> Namespace:
         "rollout_skip_special_tokens": True,
         "rollout_stop": None,
         "rollout_stop_token_ids": None,
-        "sglang_model_routers": None,
-        "sglang_router_ip": "127.0.0.1",
+        "sglang_model_routers": {"default": ("127.0.0.1", 30000)},
         "sglang_router_policy": "round_robin",
-        "sglang_router_port": 30000,
         "sglang_tokenizer_path": None,
     }
     values.update(overrides)
@@ -613,11 +611,10 @@ async def test_transport_bounds_seen_sessions(monkeypatch):
 
 
 def test_transport_resolves_router_address_lazily():
-    args = _args(sglang_router_ip=None, sglang_router_port=None)
+    args = _args(sglang_model_routers=None)
     transport = MilesSGLangTransport(args)
 
-    args.sglang_router_ip = "10.0.0.4"
-    args.sglang_router_port = 3210
+    args.sglang_model_routers = {"default": ("10.0.0.4", 3210)}
 
     assert transport.base_url == "http://10.0.0.4:3210/v1"
 
@@ -634,8 +631,8 @@ def test_transport_uses_default_model_router():
 
 
 def test_eval_transport_keeps_live_router_args():
-    rollout_args = _args(sglang_router_ip=None, sglang_router_port=None)
-    eval_args = _args(sglang_router_ip=None, sglang_router_port=None)
+    rollout_args = _args(sglang_model_routers=None)
+    eval_args = _args(sglang_model_routers=None)
     transport = MilesSGLangTransport(eval_args, router_args=rollout_args)
 
     rollout_args.sglang_model_routers = {"default": ("10.0.0.7", 3213)}

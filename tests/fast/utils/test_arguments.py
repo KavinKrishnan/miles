@@ -534,6 +534,14 @@ _SHARED_STORE_ARGS = [
 ]
 
 
+def _write_megatron_config(tmp_path, model_ids: list[str]) -> str:
+    import yaml
+
+    path = tmp_path / "megatron.yaml"
+    path.write_text(yaml.dump({"megatron": [{"name": model_id} for model_id in model_ids]}))
+    return str(path)
+
+
 class TestDeployComponent:
     def _parse(self, extra):
         parser = argparse.ArgumentParser()
@@ -556,8 +564,17 @@ class TestDeployComponent:
 
     def test_rejects_a_component_that_is_not_one_of_the_four(self):
         """The four values partition the run, so a fifth name would deploy an undefined subset."""
-        with pytest.raises(SystemExit):
-            self._parse(["--deploy-component", "router"])
+        with pytest.raises(ValueError):
+            validate_deploy_component(self._parse(["--deploy-component", "router"]))
+
+    def test_an_instance_of_a_component_that_comes_in_instances_validates(self):
+        """A multi policy run installs one trainer deployment per policy, each naming its own model id."""
+        validate_deploy_component(self._parse(["--deploy-component", "trainer:policy_a", *_SHARED_STORE_ARGS]))
+
+    def test_rejects_an_instance_of_a_component_a_run_deploys_exactly_one_of(self):
+        """Naming an instance of the orchestration script would deploy a second copy of the run itself."""
+        with pytest.raises(AssertionError, match="names an instance of primary"):
+            validate_deploy_component(self._parse(["--deploy-component", "primary:one", *_SHARED_STORE_ARGS]))
 
     @pytest.mark.parametrize("component", ["trainer", "inference"])
     def test_a_deployment_without_the_orchestration_script_needs_no_addresses(self, component):
@@ -777,6 +794,122 @@ class TestDeployComponent:
         """Colocated trainers and engines share gpus, so they can only be installed as one unit."""
         with pytest.raises(AssertionError, match="--colocate"):
             validate_deploy_component(self._parse(["--deploy-component", "trainer", "--colocate"]))
+
+    def test_a_colocated_single_policy_run_stays_allowed(self):
+        """One policy has one trainer, so its engines have exactly one set of nodes to sit on."""
+        validate_deploy_component(self._parse(["--colocate"]))
+
+    def test_refuses_to_colocate_a_run_that_trains_several_policies(self, tmp_path):
+        """With two trainers, which of them an engine shares gpus with would be undefined."""
+        with pytest.raises(AssertionError, match="which trainer an engine belongs beside"):
+            validate_deploy_component(
+                self._parse(["--colocate", "--megatron-config", _write_megatron_config(tmp_path, ["a", "b"])])
+            )
+
+    def test_refuses_to_colocate_a_single_named_instance(self, tmp_path):
+        """The engines pinned onto a trainer's nodes are installed with it, never as a deployment of their own."""
+        with pytest.raises(AssertionError, match="install one instance of them on its own"):
+            validate_deploy_component(self._parse(["--deploy-component", "trainer:a", "--colocate"]))
+
+    def test_an_engine_only_deployment_needs_the_controller_it_registers_into(self):
+        """It deploys no controller of its own, so without an address its engines join nothing."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            validate_deploy_component(self._parse_validated(["--deploy-component", "inference:east"]))
+
+    def test_an_engine_only_deployment_may_name_the_controller_of_another_release(self):
+        """The controller lives in the unnamed inference release, which this launch does not deploy."""
+        validate_deploy_component(
+            self._parse_validated(
+                [
+                    "--deploy-component",
+                    "inference:east",
+                    "--inference-controller-addrs",
+                    "http://10.0.0.4:8000",
+                    "--registration-token",
+                    "secret",
+                    *_SHARED_STORE_ARGS,
+                ]
+            )
+        )
+
+    def test_an_engine_only_deployment_without_a_shared_token_is_refused(self):
+        """A token defaulting to None leaves a cross-datacenter endpoint that takes membership from anyone."""
+        with pytest.raises(AssertionError, match="--registration-token"):
+            validate_deploy_component(
+                self._parse_validated(
+                    [
+                        "--deploy-component",
+                        "inference:east",
+                        "--inference-controller-addrs",
+                        "http://10.0.0.4:8000",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
+
+    def test_a_run_that_waits_for_reporters_without_a_shared_token_is_refused(self):
+        """The receiving side has to authenticate too, or the token on the reporting side proves nothing."""
+        with pytest.raises(AssertionError, match="--registration-token"):
+            validate_deploy_component(
+                self._parse_validated(
+                    ["--deploy-component", "inference", "--expected-registration-reporters", "1", *_SHARED_STORE_ARGS]
+                )
+            )
+
+    def test_refuses_to_colocate_a_run_that_other_deployments_register_engines_into(self):
+        """A colocated weight update writes to gpus of its own nodes, which a registered engine has none of."""
+        with pytest.raises(AssertionError, match="hold gpus of their own"):
+            validate_deploy_component(
+                self._parse(["--colocate", "--expected-registration-reporters", "1", "--registration-token", "secret"])
+            )
+
+    def test_the_inference_release_may_not_name_the_controller_it_deploys(self):
+        """A launch reaches what it deploys by the names of its own release, never by a static address."""
+        with pytest.raises(AssertionError, match="deploys it here"):
+            validate_deploy_component(
+                self._parse_validated(
+                    [
+                        "--deploy-component",
+                        "inference",
+                        "--inference-controller-addrs",
+                        "http://10.0.0.4:8000",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
+
+    def test_an_engine_only_deployment_does_not_wait_for_reporters_itself(self):
+        """It is the one that reports; waiting for reporters belongs to the release holding the controller."""
+        with pytest.raises(AssertionError, match="--expected-registration-reporters"):
+            validate_deploy_component(
+                self._parse_validated(
+                    [
+                        "--deploy-component",
+                        "inference:east",
+                        "--inference-controller-addrs",
+                        "http://10.0.0.4:8000",
+                        "--registration-token",
+                        "secret",
+                        "--expected-registration-reporters",
+                        "2",
+                    ]
+                )
+            )
+
+    def test_a_primary_deployment_still_names_the_one_inference_controller(self):
+        """There is exactly one controller in a run, and the orchestration script drives it directly."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            validate_deploy_component(
+                self._parse_validated(
+                    [
+                        "--deploy-component",
+                        "primary",
+                        "--trainer-controller-addrs",
+                        "10.0.0.1:8000",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
 
 
 class TestEvalSglangOverrides:

@@ -4,6 +4,7 @@ import pytest
 import ray
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_alive_cell, make_cell
 
+from miles.ray.specs.trainer_identity import DEFAULT_TRAINER_ROLE
 from miles.ray.train.group import TrainerController
 from miles.utils.ft_utils.health_checker import ActivenessTracker
 from miles.utils.retry_utils import NonRetryableError
@@ -20,6 +21,7 @@ _DUMMY_DATA_PACK = {"data_ref": "data", "sample_indices": [0]}
 
 def _make_controller(cells: list) -> TrainerController:
     group = object.__new__(TrainerController)
+    group._role = DEFAULT_TRAINER_ROLE
     group._cells_by_id = {cell.cell_id: cell for cell in cells}
     group.args = SimpleNamespace(enable_event_analyzer=False, save_debug_event_data=None)
     group._witness_allocator = None

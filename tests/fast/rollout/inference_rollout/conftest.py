@@ -32,13 +32,13 @@ def _build_mock_args(extra_argv: list[str] | None = None):
         "--rm-type",
         "math",
         "--use-miles-router",
-        "--sglang-router-ip",
-        "127.0.0.1",
         "--sglang-router-port",
         "30000",
     ] + (extra_argv or [])
     with patch("sys.argv", argv):
-        return parse_args()
+        args = parse_args()
+    args.sglang_model_routers = {"default": ("127.0.0.1", args.sglang_router_port)}
+    return args
 
 
 @pytest.fixture

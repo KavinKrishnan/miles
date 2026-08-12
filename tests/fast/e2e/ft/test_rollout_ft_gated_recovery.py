@@ -33,6 +33,9 @@ class _StubProvider:
     async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
         raise AssertionError(f"this module addresses cells through a patched _compute_addr_info ({worker_name=})")
 
+    def invalidate_cell(self, cell_id: str) -> None:
+        return None
+
 
 class _FakeRouter:
     def __init__(self) -> None:
@@ -169,6 +172,8 @@ class _Harness:
         self.controller.context_lock = ContextLock("InferenceController")
         self.controller._watcher_disposers = []
         self.controller._ticker = None
+        self.controller._cell_reconcile_slots = {}
+        self.controller._registration_provider = None
         self.controller._health_checker_activeness = ActivenessTracker(active=True)
         self.controller.servers = {
             "default": RolloutServer(

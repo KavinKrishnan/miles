@@ -84,8 +84,7 @@ def make_args(**overrides) -> Namespace:
         rollout_submission_granularity=None,
         dynamic_sampling_filter_path=None,
         rollout_sample_filter_path=None,
-        sglang_router_ip="127.0.0.1",
-        sglang_router_port=30000,
+        sglang_model_routers={"default": ("127.0.0.1", 30000)},
         eval_num_gpus=0,
         megatron_config=None,
     )

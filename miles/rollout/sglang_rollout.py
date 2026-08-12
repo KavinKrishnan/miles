@@ -16,6 +16,7 @@ from tqdm import tqdm
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.inference_rollout.compatibility import load_generate_function
+from miles.rollout.router_addressing import compute_router_url, compute_sample_router_url
 from miles.utils import dumper_utils
 from miles.utils.async_utils import run
 from miles.utils.data import Dataset
@@ -102,14 +103,9 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
         url = get_model_url(args, "ref", "/generate")
         resp = await post(url, json=payload)
 
-    Falls back to the default router if *model_name* is not found or
-    ``sglang_model_routers`` is not set.
+    Falls back to the primary model's router if *model_name* is not found.
     """
-    routers = args.sglang_model_routers
-    if routers and model_name in routers:
-        ip, port = routers[model_name]
-        return f"http://{ip}:{port}{endpoint}"
-    return f"http://{args.sglang_router_ip}:{args.sglang_router_port}{endpoint}"
+    return compute_router_url(args, model_id=model_name, endpoint=endpoint)
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -189,7 +185,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_sample_router_url(args, sample, endpoint="/generate")
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -441,13 +437,9 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-    urls = router_worker_base_urls(urls)
+    urls: list[str] = []
+    for model_id in args.sglang_model_routers:
+        urls += await _compute_router_worker_urls(args, model_id=model_id)
 
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
@@ -481,6 +473,16 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         logger.info(f"Collected {count} partial samples into the data buffer")
 
     return aborted_samples
+
+
+async def _compute_router_worker_urls(args: Namespace, *, model_id: str) -> list[str]:
+    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
+        response = await get(compute_router_url(args, model_id=model_id, endpoint="/list_workers"))
+        urls = response["urls"]
+    else:
+        response = await get(compute_router_url(args, model_id=model_id, endpoint="/workers"))
+        urls = [worker["url"] for worker in response["workers"]]
+    return router_worker_base_urls(urls)
 
 
 async def generate_rollout_async(

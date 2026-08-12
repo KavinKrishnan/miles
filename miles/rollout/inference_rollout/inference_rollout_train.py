@@ -11,6 +11,7 @@ from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.router_addressing import compute_router_url
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
@@ -55,10 +56,10 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
 async def get_worker_urls(args: Namespace):
     if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+        response = await get(compute_router_url(args, endpoint="/list_workers"))
         urls = response["urls"]
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        response = await get(compute_router_url(args, endpoint="/workers"))
         urls = [worker["url"] for worker in response["workers"]]
     return router_worker_base_urls(urls)
 
@@ -172,7 +173,7 @@ async def generate_rollout_async(
     await recompute_samples_rollout_logprobs_via_prefill(
         args,
         [sample for group in data for sample in group],
-        url=f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+        url=compute_router_url(args, endpoint="/generate"),
         sampling_params=state.sampling_params,
     )
 

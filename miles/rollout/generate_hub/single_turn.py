@@ -9,6 +9,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
     compute_routing_headers,
     update_sample_from_response,
 )
+from miles.rollout.router_addressing import compute_sample_router_url
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
@@ -18,7 +19,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     sample = input.sample
     sampling_params = input.sampling_params
     assert sample.status in {Sample.Status.PENDING, Sample.Status.ABORTED}, f"{sample.status=}"
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_sample_router_url(args, sample, endpoint="/generate")
 
     prompt_ids = compute_prompt_ids_from_sample(input.state, sample)
 

@@ -113,6 +113,20 @@ class TestComputeModelArgs:
         assert (model_b.lr, model_b.tensor_model_parallel_size) == (1e-6, 1)
         assert (args.lr, args.tensor_model_parallel_size) == (1e-6, 1)
 
+    def test_a_multi_policy_run_stamps_the_trainer_model_id_on_every_policy(self, tmp_path):
+        """Downstream artifact naming reads trainer_model_id off the per-policy args."""
+        path = _write_yaml({"megatron": [{"name": "a"}, {"name": "b"}]}, tmp_path)
+        args = _make_args(path)
+
+        assert compute_model_args(args, "a").trainer_model_id == "a"
+        assert compute_model_args(args, "b").trainer_model_id == "b"
+
+    def test_a_single_policy_run_leaves_the_trainer_model_id_unset(self, tmp_path):
+        """A lone policy keeps its artifacts unnamespaced, so its trainer model id stays None."""
+        path = _write_yaml({"megatron": [{"name": "a"}]}, tmp_path)
+
+        assert compute_model_args(_make_args(path), "a").trainer_model_id is None
+
     def test_a_valueless_flag_becomes_true(self, tmp_path):
         """store_true arguments have no value on the command line."""
         path = _write_yaml({"megatron": [{"name": "a", "args": "--sequence-parallel"}, {"name": "b"}]}, tmp_path)
@@ -237,3 +251,18 @@ class TestModelIdNames:
 
         with pytest.raises(AssertionError, match="not usable as path components"):
             resolve_megatron_config(_make_args(path))
+
+
+class TestModelIdsMustSurviveReleaseNaming:
+    def test_model_ids_that_fold_onto_one_release_name_are_refused(self, tmp_path):
+        """`helm upgrade --install` overwrites silently, so two trainers under one release name lose one of them."""
+        path = _write_yaml({"megatron": [{"name": "policy_a"}, {"name": "policy-a"}]}, tmp_path)
+
+        with pytest.raises(AssertionError, match="silently overwrite each other"):
+            resolve_megatron_config(_make_args(path))
+
+    def test_model_ids_that_stay_distinct_are_accepted(self, tmp_path):
+        """Ordinary names differ after sanitizing too, and must not be caught by this check."""
+        path = _write_yaml({"megatron": [{"name": "policy_a"}, {"name": "policy_b"}]}, tmp_path)
+
+        assert resolve_megatron_config(_make_args(path)).model_ids == ["policy_a", "policy_b"]

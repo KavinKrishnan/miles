@@ -24,6 +24,12 @@ def _make_args(**overrides) -> Namespace:
         critic_num_gpus_per_node=0,
         use_critic=False,
         critic_train_only=False,
+        deploy_component="all",
+        megatron_config=None,
+        kl_coef=0,
+        use_kl_loss=False,
+        use_opd=False,
+        opd_type="megatron",
     )
     defaults.update(overrides)
     return Namespace(**defaults)

@@ -25,7 +25,10 @@ def _make_updater(calls: list[tuple[str, dict]]) -> UpdateWeightFromDiskDelta:
         update_weight_disk_dir="/shared/delta",
         pause_generation_mode="retract",
         check_weight_update_equal=False,
+        trainer_model_id=None,
     )
+    updater.delta_dir = "/shared/delta"
+    updater._local_checkpoint_dir = "/local/ckpt"
     updater.rollout_engines = [_RecordingApiClient(calls)]
     updater.weight_version = 7
     updater._post_write_hook = None
@@ -103,7 +106,7 @@ def test_baseline_capture_pulls_with_both_checkpoint_dirs(tmp_path):
     assert calls[0][1] == {
         "target_version": 0,
         "local_checkpoint_dir": "/local/ckpt",
-        "source_dir": "/shared/delta",
+        "source_dir": str(tmp_path / "delta"),
     }
 
 

@@ -6,6 +6,7 @@ import re
 
 from qa_em_format import compute_score_em
 
+from miles.rollout.router_addressing import compute_router_url
 from miles.rollout.sglang_rollout import GenerateState
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
@@ -147,7 +148,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     state = GenerateState(args)
 
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_router_url(args, endpoint="/generate")
 
     # Handle partial rollout samples: continue generation from existing response
     prompt_text = sample.prompt

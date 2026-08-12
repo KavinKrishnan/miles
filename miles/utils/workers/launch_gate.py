@@ -4,13 +4,15 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.retry_utils import retry_until_deadline
 
 GATE_PORT_NAME = "gate"
+GATE_TIMEOUT_META_KEY = "launch_gate_timeout_seconds"
+LAUNCH_GATE_TIMEOUT_SECONDS = 1800.0
 
 _INITIAL_DELAY_SECONDS = 1.0
 _MAX_DELAY_SECONDS = 5.0
 _ATTEMPT_TIMEOUT_SECONDS = 30.0
 
 
-async def activate_launch_gate(gate_url: str, timeout: float = 1800.0) -> None:
+async def activate_launch_gate(gate_url: str, timeout: float = LAUNCH_GATE_TIMEOUT_SECONDS) -> None:
     async def _activate(remaining_seconds: float) -> None:
         response = await GeneralHttpClientProvider.client().post(
             f"{gate_url}/gate/activate",

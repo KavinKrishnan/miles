@@ -10,12 +10,13 @@ from tests.fast.ray.rollout.conftest import make_args
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout import inference_controller as inference_controller_module
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin
-from miles.ray.rollout.inference_controller import InferenceController, _compute_server_cell_meta_from_info
+from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.rollout.rollout_server import RolloutServer
-from miles.ray.rollout.server_cell import ServerCellMetadata
+from miles.ray.rollout.server_cell import ServerCellMetadata, compute_server_cell_meta_from_info
 from miles.ray.specs.inference import compute_engine_pool_ids, compute_router_pool_id, specs_inference_engine
 from miles.utils.context_lock import ContextLock
 from miles.utils.ft_utils.health_checker import ActivenessTracker
+from miles.utils.workers.registration.models import RegistrationAck, RegistrationSnapshot, compute_snapshot_digest
 from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
 from miles.utils.workers.rpc.common.metadata import collect_rpc_method_specs
 from miles.utils.workers.worker_info import WorkerInfo
@@ -46,6 +47,17 @@ def _make_cell_info(
             needs_offload=False,
             update_weights=True,
         ),
+    )
+
+
+def _make_snapshot() -> RegistrationSnapshot:
+    return RegistrationSnapshot(
+        reporter_id="west",
+        epoch="epoch-1",
+        sequence=1,
+        digest=compute_snapshot_digest(cells=[], expected_num_cells_by_model={}),
+        expected_num_cells_by_model={},
+        cells=[],
     )
 
 
@@ -81,15 +93,23 @@ class _RecordingServer:
         self.calls.append(("check_weights", action))
         return [self.model_name]
 
-    async def add_cell(self, cell_meta: ServerCellMetadata):
-        self.calls.append(("add", cell_meta.cell_id))
-        self.server_cells[cell_meta.cell_id] = SimpleNamespace(meta=cell_meta)
+    async def bring_up_cell(self, cell_meta: ServerCellMetadata):
+        self.calls.append(("bring up", cell_meta.cell_id))
+        return SimpleNamespace(meta=cell_meta)
+
+    def commit_cell(self, cell) -> bool:
+        self.calls.append(("add", cell.meta.cell_id))
+        self.server_cells[cell.meta.cell_id] = cell
+        return True
 
     async def remove_cell(self, cell_id: str):
         self.calls.append(("remove", cell_id))
         del self.server_cells[cell_id]
 
     async def wait_expected_num_cells(self) -> None:
+        return None
+
+    def remove_unreachable_cells(self) -> None:
         return None
 
     async def dispose(self) -> None:
@@ -143,6 +163,11 @@ def _make_controller(servers: dict, *, engine_provider: _FakeWorkerProvider | No
     controller._health_checker_activeness = ActivenessTracker(active=True)
     controller._engine_provider = engine_provider if engine_provider is not None else _FakeWorkerProvider([])
     controller._router_providers = [_FakeWorkerProvider([])]
+    controller._registration_provider = None
+    controller._router_addrs = {}
+    controller._watcher_disposers = []
+    controller._ticker = None
+    controller._cell_reconcile_slots = {}
     return controller
 
 
@@ -320,20 +345,23 @@ class TestGlobalHealthCheckerActiveness:
             received.update(kwargs)
             return {"default": _RecordingServer()}
 
+        async def _fake_resolve_router_addrs(args: Namespace, **kwargs: Any) -> dict[str, HostAndPort]:
+            return {"default": HostAndPort(host="10.0.0.1", port=30000)}
+
         monkeypatch.setattr(inference_controller_module, "create_rollout_servers", _fake_create_rollout_servers)
-        monkeypatch.setattr(
-            inference_controller_module,
-            "RayWorkerProvider",
-            SimpleNamespace(create=lambda *, pool_ids: _FakeWorkerProvider([]).created_with(pool_ids)),
+        monkeypatch.setattr(inference_controller_module, "resolve_router_addrs", _fake_resolve_router_addrs)
+        controller = InferenceController(
+            make_args(), engine_provider=_FakeWorkerProvider([]), router_providers=[_FakeWorkerProvider([])]
         )
-        controller = InferenceController(make_args())
 
         await controller.init()
-
-        get_activeness = received["global_health_checker_activeness"]
-        assert get_activeness().active is True
-        controller._health_checker_activeness.bump_active(False)
-        assert get_activeness().active is False
+        try:
+            get_activeness = received["global_health_checker_activeness"]
+            assert get_activeness().active is True
+            controller._health_checker_activeness.bump_active(False)
+            assert get_activeness().active is False
+        finally:
+            await controller.dispose()
 
 
 class TestInitSubscription:
@@ -409,6 +437,74 @@ class TestInitSubscription:
         assert srv.calls == [("add", engine_info.cell_id)]
 
 
+class _RecordingRegistrationProvider:
+    def __init__(self) -> None:
+        self.snapshots: list[RegistrationSnapshot] = []
+
+    async def apply_snapshot(self, snapshot: RegistrationSnapshot) -> RegistrationAck:
+        self.snapshots.append(snapshot)
+        return RegistrationAck(applied_sequence=snapshot.sequence, applied_digest=snapshot.digest)
+
+
+class TestRouterUrls:
+    @pytest.mark.asyncio
+    async def test_the_controller_publishes_the_router_of_every_model(self, monkeypatch: pytest.MonkeyPatch):
+        """An aggregate router in front of this controller learns the routers it fronts from here."""
+        _patch_init(monkeypatch, servers={"actor": _RecordingServer(), "ref": _RecordingServer()})
+        controller = InferenceController(
+            make_args(), engine_provider=_FakeWorkerProvider([]), router_providers=[_FakeWorkerProvider([])]
+        )
+
+        await controller.init()
+        try:
+            assert await controller.get_router_urls() == {
+                "actor": "http://10.0.0.1:30000",
+                "ref": "http://10.0.0.1:30000",
+            }
+        finally:
+            await controller.dispose()
+
+    @pytest.mark.asyncio
+    async def test_a_controller_that_never_resolved_a_router_answers_nothing(self):
+        """--debug-train-only resolves no router, and the caller must be told so rather than crash."""
+        controller = _make_controller({})
+
+        assert await controller.get_router_urls() == {}
+
+
+class TestRegistrationSnapshots:
+    @pytest.mark.asyncio
+    async def test_a_snapshot_reaches_the_registration_provider(self):
+        """The controller's own rpc server is the registration endpoint, so orchestration restarts cannot lose it."""
+        registration_provider = _RecordingRegistrationProvider()
+        controller = InferenceController(
+            make_args(),
+            engine_provider=_FakeWorkerProvider([]),
+            router_providers=[_FakeWorkerProvider([])],
+            registration_provider=registration_provider,
+        )
+
+        ack = await controller.apply_registration_snapshot(_make_snapshot())
+
+        assert [snapshot.reporter_id for snapshot in registration_provider.snapshots] == ["west"]
+        assert ack.applied_sequence == 1
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_expects_no_reporter_refuses_a_snapshot(self):
+        """A run whose barrier does not count remote cells must not quietly take them either."""
+        controller = InferenceController(
+            make_args(), engine_provider=_FakeWorkerProvider([]), router_providers=[_FakeWorkerProvider([])]
+        )
+
+        with pytest.raises(AssertionError, match="does not expect any"):
+            await controller.apply_registration_snapshot(_make_snapshot())
+
+    @pytest.mark.asyncio
+    async def test_the_snapshot_call_is_an_rpc_method_of_the_controller(self):
+        """A reporter reaches the controller over rpc, so the call has to be on its wire surface."""
+        assert "apply_registration_snapshot" in collect_rpc_method_specs(InferenceController)
+
+
 class TestEngineMetaContract:
     def test_the_real_spec_meta_roundtrips_into_server_cell_metadata(self, tmp_path: Path):
         """The engine spec's meta dict and the driver-side reader share one key set, pinned end to end."""
@@ -433,7 +529,7 @@ class TestEngineMetaContract:
             meta=spec.meta(WorkerMetaContext(cell_index=1)),
         )
 
-        assert _compute_server_cell_meta_from_info(info) == ServerCellMetadata(
+        assert compute_server_cell_meta_from_info(info) == ServerCellMetadata(
             model_id="default",
             worker_type="decode",
             cell_id="inference-engine-0-0-1",

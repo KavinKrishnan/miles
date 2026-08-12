@@ -173,8 +173,6 @@ def make_args(
         "/dev/null",
         "--rm-type",
         "math",
-        "--sglang-router-ip",
-        "127.0.0.1",
         "--sglang-router-port",
         str(router_port),
         "--rollout-max-response-len",
@@ -207,6 +205,8 @@ def make_args(
 
     with patch("sys.argv", argv):
         args = parse_args()
+
+    args.sglang_model_routers = {"default": ("127.0.0.1", router_port)}
 
     # R3 decode shape overrides — not CLI flags (derived from the model config
     # in production). Applied here, before with_session_server copies args into

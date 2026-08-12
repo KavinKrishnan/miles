@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 from omegaconf import OmegaConf
+from miles.rollout.router_addressing import compute_router_url
 from miles.utils.eval_config import DATASET_RUNTIME_SPECS, _apply_dataset_field_overrides
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ class EvalDelegateClient:
         if not env_configs:
             return None
 
-        router_addr = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+        router_addr = compute_router_url(args)
         delegates: list[EvalClient] = []
         for env_cfg in env_configs:
             delegate = cls._create_delegate(env_cfg, router_addr)

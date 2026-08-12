@@ -4,7 +4,7 @@ import os
 import random
 from argparse import Namespace
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Any
 
 import ray
 import torch
@@ -13,6 +13,7 @@ import torch.distributed as dist
 import miles.utils.eval_config
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.ray.rollout.updatable_engines import UpdatableEngines
+from miles.ray.specs.trainer_identity import CRITIC_TRAINER_ROLE
 from miles.utils import object_store
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
@@ -46,7 +47,7 @@ class TrainRayActor(NodeProbeMixin):
         args,
         world_size: int,
         rank: int,
-        role: Literal["actor", "critic"],
+        role: str,
         cell_index: int,
     ):
         self.args = args
@@ -63,7 +64,13 @@ class TrainRayActor(NodeProbeMixin):
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 
         configure_logger(
-            args, source=TrainProcessIdentity(component=role, cell_index=cell_index, rank_within_cell=rank)
+            args,
+            source=TrainProcessIdentity(
+                component="critic" if role == CRITIC_TRAINER_ROLE else "actor",
+                model_id=args.trainer_model_id,
+                cell_index=cell_index,
+                rank_within_cell=rank,
+            ),
         )
 
         object_store.init_instance(args)

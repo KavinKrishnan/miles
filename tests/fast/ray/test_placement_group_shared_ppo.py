@@ -10,6 +10,12 @@ from miles.ray.placement_group import _get_placement_group_layout
 def _layout_args(**overrides):
     values = {
         "deploy_component": "all",
+        "megatron_config": None,
+        "use_critic": False,
+        "kl_coef": 0,
+        "use_kl_loss": False,
+        "use_opd": False,
+        "opd_type": "megatron",
         "actor_num_nodes": 1,
         "actor_num_gpus_per_node": 2,
         "rollout_num_gpus": 4,
@@ -32,6 +38,13 @@ def _layout_args(**overrides):
 )
 def test_shared_ppo_counts_actor_bundles_once(colocate, expected):
     assert _get_placement_group_layout(_layout_args(colocate=colocate)) == expected
+
+
+def test_a_shared_critic_reserves_no_bundles_of_its_own():
+    """Shared PPO overlays the critic on the actor's gpus, so adding its own would over-reserve the cluster."""
+    args = _layout_args(use_critic=True, critic_num_nodes=1, critic_num_gpus_per_node=2)
+
+    assert _get_placement_group_layout(args) == (6, 2)
 
 
 def test_debug_train_only_counts_actor_bundles_once():

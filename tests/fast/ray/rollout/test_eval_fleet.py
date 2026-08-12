@@ -211,7 +211,7 @@ class TestEvalFleetSession:
         make_session(FakeInferenceController([]))
 
         (state_args,) = fleet_states
-        assert (state_args.sglang_router_ip, state_args.sglang_router_port) == ("10.0.0.2", 31000)
+        assert state_args.sglang_model_routers == {"default": ("10.0.0.2", 31000), "eval": ("10.0.0.2", 31000)}
         assert (state_args.rollout_num_gpus, state_args.rollout_num_gpus_per_engine) == (2, 1)
 
     async def test_pins_over_rpc_and_returns_the_cached_state(self, fleet_states):

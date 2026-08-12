@@ -16,7 +16,7 @@ from miles.ray.rollout.external_engine_provider import (
     _fetch_server_info_with_retry,
     static_inference_engine_provider,
 )
-from miles.ray.rollout.inference_controller import _compute_server_cell_meta_from_info
+from miles.ray.rollout.server_cell import compute_server_cell_meta_from_info
 from miles.utils.workers.worker_provider.base import CellInfo
 
 
@@ -388,7 +388,7 @@ class TestStaticInferenceEngineWorkerProvider:
         provider = await self._make_provider(monkeypatch, args, {"http://host1:8000": payload})
 
         (info,) = provider.cell_infos
-        meta = _compute_server_cell_meta_from_info(info)
+        meta = compute_server_cell_meta_from_info(info)
 
         assert (meta.worker_type, meta.num_gpus_per_engine, meta.workers_hash) == (
             "decode",

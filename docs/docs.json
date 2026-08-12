@@ -234,6 +234,7 @@
         "pages": [
          "advanced/cluster-backend",
          "advanced/split-deployment",
+         "advanced/multi-instance-deployment",
          "advanced/multi-policy"
         ],
         "expanded": false

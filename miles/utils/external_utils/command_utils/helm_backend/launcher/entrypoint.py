@@ -39,7 +39,7 @@ from miles.utils.external_utils.command_utils.helm_backend.orchestrator.observer
 from miles.utils.external_utils.model_args_utils import shell_safe_model_args
 from miles.utils.run_uuid import derive_run_uuid
 from miles.utils.workers.serving.utils import override_argv
-from miles.utils.workers.types import ClusterBackend, DeployComponent
+from miles.utils.workers.types import ClusterBackend, DeploySelector
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,13 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
 
     namespace = config.namespace
     args = _parse_train_args(request, run_id=run_id)
-    deploy_component = DeployComponent(args.deploy_component)
-    assert deploy_component is config.deploy_component, (
-        f"the run's pods are told {deploy_component.value} while everything this launch installs is named after "
-        f"{config.deploy_component.value}"
+    selector = DeploySelector.of(args)
+    assert selector == config.deploy_selector, (
+        f"the run's pods are told {selector.value} while everything this launch installs is named after "
+        f"{config.deploy_selector.value}"
     )
-    deploys_orchestration_script = deploy_component.deploys_orchestration_script()
-    release = RunNames.release(run_id=run_id, deploy_component=deploy_component)
+    deploys_orchestration_script = selector.deploys_orchestration_script()
+    release = RunNames.release_of(run_id=run_id, selector=selector)
     mooncake_plan = MooncakeInfo.plan_of_args(args)
     pod_argv = _compute_pod_argv(
         request,

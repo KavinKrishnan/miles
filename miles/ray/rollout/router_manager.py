@@ -28,10 +28,10 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
         _record_router_addrs(args, router_addrs=static_addrs)
         return static_addrs
 
-    if args.sglang_router_ip is not None:
-        assert args.sglang_model_routers is not None, (
+    if args.sglang_model_routers is not None:
+        assert len(args.sglang_model_routers) > 0, (
             "external router mode was removed: miles always resolves its own routers "
-            "(a pre-set router address without the per-model map means a misconfigured run)"
+            "(an empty per-model router map means a misconfigured run)"
         )
         return {name: HostAndPort(host=host, port=port) for name, (host, port) in args.sglang_model_routers.items()}
 
@@ -41,7 +41,9 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
         f"(got {len(router_providers)} for {len(config.models)} models)"
     )
     router_addrs = {
-        model_cfg.name: await wait_router_ready(model_idx=model_idx, provider=router_providers[model_idx])
+        model_cfg.name: await wait_router_ready(
+            worker_name=compute_router_worker_name(model_idx), provider=router_providers[model_idx]
+        )
         for model_idx, model_cfg in enumerate(config.models)
     }
 
@@ -51,15 +53,11 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
 
 
 def _record_router_addrs(args, *, router_addrs: dict[str, HostAndPort]) -> None:
-    primary = next(iter(router_addrs.values()))
-    args.sglang_router_ip = primary.host
-    args.sglang_router_port = primary.port
     args.sglang_model_routers = {name: (addr.host, addr.port) for name, addr in router_addrs.items()}
 
 
-async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> HostAndPort:
+async def wait_router_ready(*, worker_name: str, provider: BaseWorkerProvider) -> HostAndPort:
     """Wait until the model's router, launched by the platform, is reachable and return its address."""
-    worker_name = compute_router_worker_name(model_idx)
     router_addr = (await provider.get_addrs(worker_name=worker_name))["primary"]
     wait_tcp_ready(router_addr.host, router_addr.port, timeout=30)
     logger.info(f"Router ready at {router_addr}")

@@ -33,7 +33,13 @@ from miles.utils.megatron_config import (
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
-from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
+from miles.utils.workers.types import (
+    ClusterBackend,
+    DeployComponent,
+    DeploySelector,
+    WorkerCommBackend,
+    resolve_worker_comm_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +160,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--deploy-component",
                 type=str,
                 default=DeployComponent.ALL.value,
-                choices=tuple(component.value for component in DeployComponent),
                 help=(
                     "Which part of the run this launch deploys: `all` deploys every worker, `trainer` the trainer "
                     "controller and its megatron ranks, `inference` the inference controller with its sglang engines "
                     "and routers, and `primary` everything else (rollout executor, orchestration script, api server, "
-                    "session servers). Deploying a subset takes one launch per subset, and the launch that carries "
+                    "session servers). A run that deploys several instances of one component names the instance "
+                    "after it, as `trainer:<role>` or `inference:<name>`, so that each instance is a deployment "
+                    "of its own; a trainer's role is its model id in a multi policy run and `actor` in a "
+                    "single policy one. Deploying a subset takes one launch per subset, and the launch that "
+                    "carries "
                     "the orchestration script reaches the others through their statically given addresses."
                 ),
             )
@@ -193,6 +202,35 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Address of the router of an independently deployed inference side, one per model, as host:port "
                     "or http://host:port, prefixed as <model>=<address> for multi-model runs. Required together "
                     "with --inference-controller-addrs, because the routers live with the engines they serve."
+                ),
+            )
+            parser.add_argument(
+                "--expected-registration-reporters",
+                type=int,
+                default=0,
+                help=(
+                    "How many engine-only deployments register their cells into this run's inference controller. "
+                    "The controller waits for all of them, and for the cells each of them declares, before the "
+                    "first weight update."
+                ),
+            )
+            parser.add_argument(
+                "--registration-token",
+                type=str,
+                default=None,
+                help=(
+                    "Shared secret an engine-only deployment presents when it registers its cells. The deployment "
+                    "that runs the inference controller and every reporting deployment pass the same value."
+                ),
+            )
+            parser.add_argument(
+                "--registration-external-hosts",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "How an engine-only deployment translates the addresses it observes into ones the inference "
+                    "controller can reach, as `<host>=<external host>` entries."
                 ),
             )
             parser.set_defaults(trainer_model_id=None)
@@ -2914,11 +2952,13 @@ def _compute_custom_inference_engine_provider_path(args: argparse.Namespace) -> 
 
 
 def validate_deploy_component(args: argparse.Namespace) -> None:
-    component = DeployComponent(args.deploy_component)
+    selector = DeploySelector.of(args)
+    component = selector.component
 
-    _validate_static_addrs_name_another_launch(args, component=component)
+    _validate_static_addrs_name_another_launch(args, selector=selector)
+    _validate_multi_instance(args, selector=selector)
 
-    if not component.is_split():
+    if not selector.is_split():
         return
 
     assert not args.colocate, (
@@ -2926,34 +2966,70 @@ def validate_deploy_component(args: argparse.Namespace) -> None:
         "installed by separate launches"
     )
 
-    if component.deploys_orchestration_script():
+    if selector.deploys_orchestration_script():
         _validate_named_deployments(args, component=component)
 
     _validate_shared_object_store(args, component=component)
     _validate_watched_cells_are_deployed_here(args, component=component)
 
 
-def _validate_static_addrs_name_another_launch(args: argparse.Namespace, *, component: DeployComponent) -> None:
+def _validate_static_addrs_name_another_launch(args: argparse.Namespace, *, selector: DeploySelector) -> None:
+    inference_flags = {"--inference-router-addrs": args.inference_router_addrs}
+    if selector.instance is None:
+        inference_flags["--inference-controller-addrs"] = args.inference_controller_addrs
+
     given_flags_by_component: dict[DeployComponent, list[str]] = {
         DeployComponent.TRAINER: _given_flags({"--trainer-controller-addrs": args.trainer_controller_addrs}),
-        DeployComponent.INFERENCE: _given_flags(
-            {
-                "--inference-controller-addrs": args.inference_controller_addrs,
-                "--inference-router-addrs": args.inference_router_addrs,
-            }
-        ),
+        DeployComponent.INFERENCE: _given_flags(inference_flags),
     }
 
     for deployed, given_flags in given_flags_by_component.items():
-        assert not (component.selects(deployed) and given_flags), (
+        assert not (selector.component.selects(deployed) and given_flags), (
             f"{' '.join(given_flags)} describe the {deployed.value} side that some other launch deploys, but "
-            f"--deploy-component {component.value} deploys it here, so this launch reaches it by the names of its "
+            f"--deploy-component {selector.value} deploys it here, so this launch reaches it by the names of its "
             f"own release"
         )
 
 
 def _given_flags(flags: dict[str, list[str] | None]) -> list[str]:
     return [flag for flag, value in flags.items() if value is not None]
+
+
+def _validate_multi_instance(args: argparse.Namespace, *, selector: DeploySelector) -> None:
+    num_policies = len(resolve_megatron_config(args).model_ids)
+    assert not args.colocate or num_policies == 1, (
+        f"--colocate pins the engines of a model onto the nodes of its trainer, and this run trains "
+        f"{num_policies} policies, so which trainer an engine belongs beside would be undefined"
+    )
+    assert not args.colocate or selector.instance is None, (
+        f"--colocate places trainers and engines on the same gpus, so --deploy-component {selector.value} cannot "
+        f"install one instance of them on its own"
+    )
+    assert not args.colocate or args.expected_registration_reporters == 0, (
+        f"--colocate pins this run's engines onto the gpus of its own trainer, and the "
+        f"{args.expected_registration_reporters} deployments registering into it hold gpus of their own, so a "
+        f"weight update would take their engines for colocated ones"
+    )
+
+    is_engine_only = selector.component is DeployComponent.INFERENCE and selector.instance is not None
+    if is_engine_only:
+        assert args.inference_controller_addrs is not None, (
+            f"--deploy-component {selector.value} deploys engines alone, and they only join the run once this "
+            f"deployment registers them, so the inference controller has to be named by "
+            f"--inference-controller-addrs"
+        )
+        assert args.expected_registration_reporters == 0, (
+            f"--deploy-component {selector.value} reports its cells to another deployment's inference controller, "
+            f"so it is not the one that waits for reporters; --expected-registration-reporters belongs to that "
+            f"deployment"
+        )
+
+    if is_engine_only or args.expected_registration_reporters > 0:
+        assert args.registration_token, (
+            "the registration endpoint is reachable from every deployment of the run, so it authenticates its "
+            "callers; pass the same --registration-token to the deployment holding the inference controller and "
+            "to every engine-only deployment registering into it"
+        )
 
 
 def _validate_named_deployments(args: argparse.Namespace, *, component: DeployComponent) -> None:

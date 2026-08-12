@@ -1,17 +1,18 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from tests.fast.ray.train import conftest as train_conftest
 
-from miles.ray.specs.train import compute_trainer_pool_id
+from miles.ray.specs.trainer_identity import DEFAULT_TRAINER_ROLE, compute_trainer_pool_id
 from miles.ray.train.group import TrainerController
 from miles.utils.workers.worker_provider.base import CellInfo, ReconcileFn, StopWatchFn
 from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 
 pytestmark = pytest.mark.asyncio
 
-_POOL_ID = compute_trainer_pool_id("actor")
+_POOL_ID = compute_trainer_pool_id(DEFAULT_TRAINER_ROLE)
 _POLL_INTERVAL_SECONDS = 0.01
 
 
@@ -56,32 +57,26 @@ def _make_args(*, num_cells: int) -> SimpleNamespace:
 
 
 @pytest.fixture
-def provider(monkeypatch) -> _RecordingWorkerProvider:
-    recording_provider = _RecordingWorkerProvider(worker_manager_handle=train_conftest.fake_worker_manager)
-
-    def _create(*, pool_ids: list[str] | None = None) -> _RecordingWorkerProvider:
-        recording_provider._pool_ids = pool_ids
-        return recording_provider
-
-    monkeypatch.setattr(RayWorkerProvider, "create", _create)
-    return recording_provider
+def provider() -> _RecordingWorkerProvider:
+    return _RecordingWorkerProvider(worker_manager_handle=train_conftest.fake_worker_manager, pool_ids=[_POOL_ID])
 
 
-async def _create_controller(*, num_cells: int) -> TrainerController:
+async def _create_controller(provider: _RecordingWorkerProvider, *, num_cells: int) -> TrainerController:
     train_conftest.fake_worker_manager.num_cells = num_cells
     controller = TrainerController(
-        _make_args(num_cells=num_cells),
-        role="actor",
+        cell_provider=provider,
+        cell_operations=MagicMock(),
+        role=DEFAULT_TRAINER_ROLE,
         with_ref=False,
     )
-    await controller.init()
+    await controller.init(_make_args(num_cells=num_cells))
     return controller
 
 
 class TestCreate:
     async def test_create_subscribes_reconcile_to_the_trainer_spec(self, provider):
         """create() must watch its own trainer spec with the controller's reconcile callback."""
-        controller = await _create_controller(num_cells=2)
+        controller = await _create_controller(provider, num_cells=2)
         try:
             assert len(provider.watch_calls) == 1
             reconcile, pool_ids = provider.watch_calls[0]
@@ -92,7 +87,7 @@ class TestCreate:
 
     async def test_create_populates_cells_from_the_initial_sync(self, provider):
         """The initial watch sync must fill in the cells before create() returns."""
-        controller = await _create_controller(num_cells=2)
+        controller = await _create_controller(provider, num_cells=2)
         try:
             assert sorted(cell.cell_index for cell in controller._cells_by_id.values()) == [0, 1]
             assert [cell.cell_index for cell in controller._cells] == [0, 1]
@@ -101,7 +96,7 @@ class TestCreate:
 
     async def test_dispose_stops_the_watch_loop(self, provider):
         """Without dispose() the 5-second poll loop outlives training and keeps logging failures."""
-        controller = await _create_controller(num_cells=1)
+        controller = await _create_controller(provider, num_cells=1)
         await asyncio.sleep(_POLL_INTERVAL_SECONDS * 5)
 
         await controller.dispose()
@@ -113,7 +108,7 @@ class TestCreate:
 
     async def test_dispose_is_idempotent(self, provider):
         """Teardown paths overlap, so a second dispose must not raise."""
-        controller = await _create_controller(num_cells=1)
+        controller = await _create_controller(provider, num_cells=1)
 
         await controller.dispose()
         await controller.dispose()

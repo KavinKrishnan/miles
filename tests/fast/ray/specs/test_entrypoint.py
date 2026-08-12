@@ -100,6 +100,12 @@ class TestDeployComponentFiltering:
             "trainer-engine-critic",
         ]
 
+    def test_naming_one_trainer_instance_installs_that_instance_alone(self, tmp_path):
+        """A release per trainer instance is the point of the instance selector, so the other role must drop out."""
+        specs = compute_specs(self._args(tmp_path, deploy_component="trainer:critic"))
+
+        assert [spec.name for spec in specs] == ["trainer-controller-critic", "trainer-engine-critic"]
+
     def test_an_inference_deployment_holds_the_controller_its_routers_and_its_engines(self, tmp_path):
         """The router belongs to the engines it fronts, so it can only be installed with them."""
         specs = compute_specs(self._args(tmp_path, deploy_component="inference"))

@@ -11,6 +11,7 @@ import pydantic
 import yaml
 
 from miles.utils.derived_args import apply_derived_args
+from miles.utils.external_utils.command_utils.helm_backend.naming import sanitize_release_instance
 from miles.utils.file_arg_utils import resolve_file_arg
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 
@@ -94,6 +95,11 @@ class MegatronConfig(FrozenStrictBaseModel):
             f"--megatron-config model names {bad_names} are not usable as path components: a model id names "
             f"this policy's checkpoint directory under --save and --load, so it must match "
             f"{MODEL_ID_PATTERN.pattern}"
+        )
+        release_names = [sanitize_release_instance(name) for name in names]
+        assert len(set(release_names)) == len(release_names), (
+            f"a policy's model id names the helm release of its trainer, and {names} fold onto {release_names}, "
+            f"so those releases would silently overwrite each other"
         )
         return cls(models=models)
 

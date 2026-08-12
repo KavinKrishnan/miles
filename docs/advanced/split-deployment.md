@@ -8,8 +8,9 @@ separate lifecycles.
 
 <Warning>
 
-**Status.** Under active development. Splitting a run is what later lets one orchestration script drive
-several trainers or several inference deployments; today it drives exactly one of each.
+**Status.** Under active development. Splitting a run is what lets one orchestration script drive
+several trainers or several inference deployments; this page describes the single-instance split, and
+[multi instance deployment](/advanced/multi-instance-deployment) the rest.
 
 </Warning>
 
@@ -69,8 +70,9 @@ on a `trainer` launch, `--inference-controller-addrs` and `--inference-router-ad
 launch, and all three on an unsplit `all` launch.
 
 - `--trainer-controller-addrs` — `host:port`, or `<role>=host:port` when the run also trains a critic.
-- `--inference-controller-addrs` — `host:port`. It takes a list so that one orchestration script can
-  later drive several inference deployments; today exactly one entry is allowed.
+- `--inference-controller-addrs` — `host:port`, one entry per inference deployment. A run whose
+  inference deployments come and go names none of them and lets them register themselves instead; see
+  [multi instance deployment](/advanced/multi-instance-deployment).
 - `--inference-router-addrs` — `host:port`, or `<model>=host:port` per model. The routers live with the
   engines they serve, so the rollout executor and the session servers are given their address too.
 - The object store master lives with the orchestration script, so the other deployments have to name it:
@@ -124,8 +126,9 @@ today.
 
 ## What this is not
 
-- **Not several trainers or several inference deployments.** The static addresses take lists so that a
-  composite controller can fan out over them later; today exactly one of each is driven.
+- **Not, on its own, several trainers or several engine pools.** A split names one instance of each.
+  Installing one release per policy trainer, and registering engine-only deployments into the run's
+  one inference controller, is [multi instance deployment](/advanced/multi-instance-deployment).
 - **Not a hot restart.** A new orchestration script does not reattach to a running trainer; the
   surviving releases are only the precondition for that.
 - **Not external rollout.** [External rollout](/advanced/external-rollout) hands Miles engines it does

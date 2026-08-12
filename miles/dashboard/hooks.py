@@ -26,6 +26,7 @@ from miles.dashboard.store import (
     TrajectoryEvent,
     TrajectoryEventKind,
 )
+from miles.rollout.router_addressing import compute_any_router_url
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.timer import Timer
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
@@ -298,8 +299,8 @@ def register_train_actor(args) -> None:
 
 
 def register_router(args) -> None:
-    """Called by the rollout manager AFTER start_rollout_servers: only then are
-    ``args.sglang_router_ip/port`` filled in. init_tracking runs earlier in
+    """Called by the rollout manager AFTER start_rollout_servers: only then is
+    ``args.sglang_model_routers`` filled in. init_tracking runs earlier in
     __init__, so the backend cannot register the router at init time."""
     if not args.use_miles_dashboard:
         return
@@ -308,11 +309,11 @@ def register_router(args) -> None:
     handle = backend.resolve_collector()
     if handle is None:
         return
-    # a None ip here is a wiring-order bug, not runtime flakiness: fail loud
-    assert args.sglang_router_ip is not None, "register_router must run after start_rollout_servers"
+    # a None router map here is a wiring-order bug, not runtime flakiness: fail loud
+    assert args.sglang_model_routers is not None, "register_router must run after start_rollout_servers"
     try:
         handle.set_router.remote(
-            f"http://{args.sglang_router_ip}:{args.sglang_router_port}",
+            compute_any_router_url(args),
             use_miles_router=args.use_miles_router,
         )
     except Exception:

@@ -24,7 +24,7 @@ class SimpleProcessIdentity(_ProcessIdentityBase):
 
 class TrainerControllerProcessIdentity(_ProcessIdentityBase):
     component: Literal["trainer_controller"] = "trainer_controller"
-    role: Literal["actor", "critic"]
+    role: str
 
     def to_name(self) -> str:
         return f"{self.component}_{self.role}"
@@ -32,11 +32,13 @@ class TrainerControllerProcessIdentity(_ProcessIdentityBase):
 
 class TrainProcessIdentity(_ProcessIdentityBase):
     component: Literal["actor", "critic"]
+    model_id: str | None = None
     cell_index: NonNegativeInt
     rank_within_cell: NonNegativeInt
 
     def to_name(self) -> str:
-        return f"{self.component}_cell{self.cell_index}_rank{self.rank_within_cell}"
+        prefix = self.component if self.model_id is None else f"{self.component}_{self.model_id}"
+        return f"{prefix}_cell{self.cell_index}_rank{self.rank_within_cell}"
 
 
 ProcessIdentity = Annotated[

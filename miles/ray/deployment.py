@@ -5,19 +5,20 @@ from collections.abc import Awaitable, Callable
 from miles.ray.specs.entrypoint import compute_specs
 from miles.ray.specs.inference import INFERENCE_CONTROLLER_POOL_ID, inference_controller_worker_name
 from miles.ray.specs.static_addrs import INFERENCE_CONTROLLER_ADDRS_FLAG, TRAINER_CONTROLLER_ADDRS_FLAG
-from miles.ray.specs.train import compute_trainer_controller_pool_id, trainer_controller_worker_name
+from miles.ray.specs.train import compute_deployed_trainer_instances, trainer_controller_worker_name
+from miles.ray.specs.trainer_identity import compute_trainer_controller_pool_id
 from miles.ray.wiring import get_backend_capability, launch_worker_manager
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.logging_utils import configure_logger
 from miles.utils.workers.backend_capability.base import BackendCapability
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_spec import RPC_PORT_NAME
 
 logger = logging.getLogger(__name__)
 
 
 def run_deployment(args, *, run_orchestration_script: Callable[[object], Awaitable[None]]) -> None:
-    if DeployComponent(args.deploy_component).deploys_orchestration_script():
+    if DeploySelector.of(args).deploys_orchestration_script():
         asyncio.run(run_orchestration_script(args))
         return
 
@@ -26,13 +27,13 @@ def run_deployment(args, *, run_orchestration_script: Callable[[object], Awaitab
 
 async def _serve_deployed_workers(args) -> None:
     configure_logger(args, source=SimpleProcessIdentity(component="main"))
-    component = DeployComponent(args.deploy_component)
+    selector = DeploySelector.of(args)
 
     _worker_manager = launch_worker_manager(args)
     logger.info(
-        f"Deployed the {component.value} workers of this run: "
+        f"Deployed the {selector.value} workers of this run: "
         f"{[spec.name for spec in compute_specs(args)]}. "
-        f"{await _describe_controller_addrs(args, component=component)}"
+        f"{await _describe_controller_addrs(args, component=selector.component)}"
     )
     logger.info(
         "This deployment carries no orchestration script, so it has no training to finish and stays up until it is "
@@ -51,7 +52,7 @@ async def _describe_controller_addrs(args, *, component: DeployComponent) -> str
         )
         return f"Reach it with {INFERENCE_CONTROLLER_ADDRS_FLAG} {addr}"
 
-    roles = ["actor", *(["critic"] if args.use_critic else [])]
+    roles = [instance.role for instance in compute_deployed_trainer_instances(args)]
     addrs = await asyncio.gather(
         *[
             _rpc_addr(

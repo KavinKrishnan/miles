@@ -10,6 +10,7 @@ import torch
 from examples.geo3k_vlm.multi_turn.base_env import BaseInteractionEnv
 
 # When executed as a module: python -m examples.geo3k_vlm.multi_turn.rollout
+from miles.rollout.router_addressing import compute_router_url
 from miles.rollout.sglang_rollout import GenerateState
 from miles.utils.http_utils import post
 from miles.utils.processing_utils import encode_image_for_rollout_engine
@@ -144,7 +145,7 @@ def _initialize_resources(args: Any, sample: Sample):
     if max_turns is None:
         raise ValueError("max_turns must be set via --custom-config-path in the custom config file.")
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = compute_router_url(args, endpoint="/generate")
     sample.metadata = sample.metadata or {}
     env = _build_env(env_module, sample, args)
     config = {"max_turns": max_turns}

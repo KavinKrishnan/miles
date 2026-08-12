@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from types import SimpleNamespace
 
@@ -32,6 +33,10 @@ class _StubServer:
     def __init__(self, server_cells: dict):
         self.server_cells = server_cells
         self.dispose_count = 0
+        self.unreachable_sweeps = 0
+
+    def remove_unreachable_cells(self) -> None:
+        self.unreachable_sweeps += 1
 
     async def dispose(self) -> None:
         self.dispose_count += 1
@@ -44,6 +49,8 @@ def _make_controller(servers: dict) -> InferenceController:
     controller.context_lock = ContextLock("InferenceController")
     controller._watcher_disposers = []
     controller._ticker = None
+    controller._cell_reconcile_slots = {}
+    controller._registration_provider = None
     return controller
 
 
@@ -110,6 +117,52 @@ class TestTickCells:
 
         assert broken.tick_count > 1
         assert healthy.tick_count > 1
+
+
+class TestTickSweepsUnreachableCellsAndStaleReporters:
+    async def test_every_sweep_asks_each_server_to_drop_what_it_cannot_reach(self):
+        """A cell nothing probes stays in the router forever, taking requests it can no longer serve."""
+        first, second = _StubServer({}), _StubServer({})
+        controller = _make_controller({"default": first, "frozen": second})
+
+        await controller._tick_cells()
+
+        assert (first.unreachable_sweeps, second.unreachable_sweeps) == (1, 1)
+
+    async def test_a_reporter_that_went_quiet_is_logged_by_the_sweep(self, caplog):
+        """Staleness never removes a cell, so a log line is the only thing that says a datacenter went quiet."""
+        controller = _make_controller({})
+        controller._registration_provider = _StubRegistrationProvider(seconds=10_000.0)
+
+        with caplog.at_level(logging.WARNING):
+            await controller._tick_cells()
+
+        assert "east" in caplog.text
+
+    async def test_a_reporter_reporting_on_time_is_not_logged(self):
+        """A warning every five seconds for a healthy run is a warning nobody ever reads."""
+        controller = _make_controller({})
+        controller._registration_provider = _StubRegistrationProvider(seconds=1.0)
+
+        await controller._tick_cells()
+
+        assert controller._registration_provider.asked == ["east"]
+
+
+class _StubRegistrationProvider:
+    def __init__(self, *, seconds: float) -> None:
+        self._seconds = seconds
+        self.asked: list[str] = []
+
+    def reporter_ids(self) -> list[str]:
+        return ["east"]
+
+    def cell_ids(self) -> list[str]:
+        return ["east-inference-engine-0-0-0"]
+
+    def seconds_since_last_snapshot(self, reporter_id: str) -> float:
+        self.asked.append(reporter_id)
+        return self._seconds
 
 
 class TestControllerDisposal:

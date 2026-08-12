@@ -6,6 +6,7 @@ from strands_sglang import SGLangClient, SGLangModel
 from strands_sglang.tool_limiter import ToolIterationLimiter
 
 from miles.rollout.rm_hub.math_dapo_utils import compute_score as math_dapo_compute_score
+from miles.rollout.router_addressing import compute_router_url
 from miles.rollout.sglang_rollout import GenerateState
 from miles.utils.types import Sample
 
@@ -27,7 +28,7 @@ _client_cache: dict[str, SGLangClient] = {}
 
 def get_client(args) -> SGLangClient:
     """Get shared client for connection pooling (like MILES)."""
-    base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    base_url = compute_router_url(args)
     if base_url not in _client_cache:
         _client_cache[base_url] = SGLangClient.from_miles_args(args)
     return _client_cache[base_url]

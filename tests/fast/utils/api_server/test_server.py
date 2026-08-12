@@ -239,15 +239,20 @@ class TestStartApiServerRegistration:
         ft_components: list[str],
         cell_ids: list[str],
         actor_cells: list[MockTrainerCell] | None = None,
+        deploy_component: str = "all",
     ) -> _CellRegistry:
         manager = MockWorkerManager(make_cell_summaries(*cell_ids))
         registries: list[_CellRegistry] = []
 
         monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["inference-engine-0-0"])
-        monkeypatch.setattr(server, "_start_api_server_raw", lambda registry, port: registries.append(registry))
+        monkeypatch.setattr(
+            server,
+            "_start_api_server_raw",
+            lambda registry, port: registries.append(registry),
+        )
 
         server.start_api_server(
-            args=make_rollout_args(),
+            args=make_rollout_args(deploy_component=deploy_component),
             actor_model=make_mock_controller(actor_cells if actor_cells is not None else []),
             inference_controller=MockInferenceController(
                 {cell_id: compute_pending_rollout_cell_status() for cell_id in cell_ids}
@@ -303,6 +308,28 @@ class TestStartApiServerRegistration:
         registry = self._start(monkeypatch, ft_components=["train", "rollout"], cell_ids=["inference-engine-0-0-0"])
 
         assert [handler.cell_type for handler in registry._handlers] == ["actor", "rollout"]
+
+    @pytest.mark.asyncio
+    async def test_a_split_deployment_watches_no_cells_of_another_deployment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cells of a split run live in other releases, so answering for them would report them all missing."""
+        registry = self._start(
+            monkeypatch,
+            ft_components=["train", "rollout"],
+            cell_ids=["inference-engine-0-0-0"],
+            deploy_component="primary",
+        )
+
+        assert registry._handlers == []
+
+    def test_the_actor_handler_covers_every_policy_trainer_pool(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A multi policy run heals one trainer pool per policy, and an uncovered pool is never healed."""
+        monkeypatch.setattr(server, "compute_policy_trainer_roles", lambda args: ["policy_a", "policy_b"])
+        registry = self._start(monkeypatch, ft_components=["train"], cell_ids=[])
+
+        (handler,) = registry._handlers
+        assert handler._pool_ids == ["trainer-engine-policy_a", "trainer-engine-policy_b"]
 
 
 class TestDynamicCells:
@@ -365,10 +392,14 @@ class TestOperationsSelection:
         registries: list[_CellRegistry] = []
         monkeypatch.setattr(server, "compute_trainer_pool_id", lambda role: f"trainer-{role}")
         monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["engine"])
-        monkeypatch.setattr(server, "_start_api_server_raw", lambda registry, port: registries.append(registry))
+        monkeypatch.setattr(
+            server,
+            "_start_api_server_raw",
+            lambda registry, port: registries.append(registry),
+        )
 
         server.start_api_server(
-            args=SimpleNamespace(),
+            args=SimpleNamespace(deploy_component="all"),
             actor_model=make_mock_controller([]),
             inference_controller=MockInferenceController(),
             port=1234,

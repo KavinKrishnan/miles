@@ -1,14 +1,24 @@
 import copy
 import os
+from argparse import Namespace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from miles.ray.specs.static_addrs import trainer_controller_urls
+from miles.ray.specs.trainer_identity import (
+    CRITIC_TRAINER_ROLE,
+    compute_trainer_controller_pool_id,
+    compute_trainer_pool_id,
+    compute_trainer_role,
+)
+from miles.ray.train.composite import CompositeTrainerController
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils.environ import default_fp8_block_scaling_fp32_scales
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
+from miles.utils.megatron_config import compute_model_args, resolve_megatron_config
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 from miles.utils.workers.worker_provider.simple import SimpleWorkerProvider
@@ -34,19 +44,104 @@ _TRAINER_ACTOR_CLASSES = {
 _NUM_GPUS_PER_TRAINER_WORKER = 0.4
 
 
-def spec_trainer_controller_actor(args) -> ServeWorkerSpec:
-    return _compute_spec_trainer_controller(
-        role="actor",
-        with_ref=args.kl_coef != 0 or args.use_kl_loss,
-        with_opd_teacher=args.use_opd and args.opd_type == "megatron",
+@dataclass(frozen=True)
+class TrainerInstance:
+    role: str
+    args: Namespace
+    num_nodes: int
+    num_gpus_per_node: int
+    gpu_offset: int
+    with_ref: bool
+    with_opd_teacher: bool
+
+    @property
+    def num_gpus(self) -> int:
+        return self.num_nodes * self.num_gpus_per_node
+
+
+def compute_trainer_instances(args) -> list[TrainerInstance]:
+    config = resolve_megatron_config(args)
+
+    ans: list[TrainerInstance] = []
+    gpu_offset = 0
+    for model_id in config.model_ids:
+        model_args = compute_model_args(args, model_id) if config.is_multi_policy else args
+        instance = TrainerInstance(
+            role=compute_trainer_role(config, model_id),
+            args=model_args,
+            num_nodes=model_args.actor_num_nodes,
+            num_gpus_per_node=model_args.actor_num_gpus_per_node,
+            gpu_offset=gpu_offset,
+            with_ref=model_args.kl_coef != 0 or model_args.use_kl_loss,
+            with_opd_teacher=model_args.use_opd and model_args.opd_type == "megatron",
+        )
+        gpu_offset += instance.num_gpus
+        ans.append(instance)
+
+    if args.use_critic:
+        ans.append(
+            TrainerInstance(
+                role=CRITIC_TRAINER_ROLE,
+                args=compute_critic_args(args),
+                num_nodes=args.critic_num_nodes,
+                num_gpus_per_node=args.critic_num_gpus_per_node,
+                gpu_offset=0,
+                with_ref=False,
+                with_opd_teacher=False,
+            )
+        )
+
+    return ans
+
+
+def compute_deployed_trainer_instances(args) -> list[TrainerInstance]:
+    selector = DeploySelector.of(args)
+    all_instances = compute_trainer_instances(args)
+    selected = [
+        instance for instance in all_instances if selector.selects(DeployComponent.TRAINER, instance=instance.role)
+    ]
+    assert selected, (
+        f"--deploy-component {selector.value} names a trainer instance this run does not train; its trainers are "
+        f"{[instance.role for instance in all_instances]}"
+    )
+    return _rebase_gpu_offsets(selected)
+
+
+def _rebase_gpu_offsets(instances: list[TrainerInstance]) -> list[TrainerInstance]:
+    ans: list[TrainerInstance] = []
+    gpu_offset = 0
+    for instance in instances:
+        if instance.role == CRITIC_TRAINER_ROLE:
+            ans.append(replace(instance, gpu_offset=0))
+            continue
+        ans.append(replace(instance, gpu_offset=gpu_offset))
+        gpu_offset += instance.num_gpus
+    return ans
+
+
+def compute_trainer_gpu_budget(args) -> int:
+    if not DeploySelector.of(args).component.selects(DeployComponent.TRAINER):
+        return 0
+    return sum(
+        instance.num_gpus
+        for instance in compute_deployed_trainer_instances(args)
+        if instance.role != CRITIC_TRAINER_ROLE
     )
 
 
-def spec_trainer_controller_critic(args) -> ServeWorkerSpec:
-    return _compute_spec_trainer_controller(
-        role="critic",
-        with_ref=False,
-        with_opd_teacher=False,
+def specs_trainer_controller(args) -> list[ServeWorkerSpec]:
+    return [_compute_spec_trainer_controller(instance) for instance in compute_deployed_trainer_instances(args)]
+
+
+def create_composite_trainer_controller(args, *, capability: BackendCapability) -> CompositeTrainerController:
+    config = resolve_megatron_config(args)
+    return CompositeTrainerController(
+        trainers={
+            model_id: create_trainer_controller_handle(
+                args, capability=capability, role=compute_trainer_role(config, model_id)
+            )
+            for model_id in config.model_ids
+        }
     )
 
 
@@ -64,10 +159,6 @@ def compute_trainer_controller_provider(args, *, capability: BackendCapability, 
     return capability.static_worker_provider(pool_id=pool_id)
 
 
-def compute_trainer_controller_pool_id(role: str) -> str:
-    return f"trainer-controller-{role}"
-
-
 def trainer_controller_worker_name(role: str) -> str:
     return compute_worker_name(pool_id=compute_trainer_controller_pool_id(role))
 
@@ -76,15 +167,12 @@ def trainer_controller_cell_id(role: str) -> str:
     return compute_cell_id(pool_id=compute_trainer_controller_pool_id(role), cell_index=0)
 
 
-def _compute_spec_trainer_controller(
-    *,
-    role: str,
-    with_ref: bool,
-    with_opd_teacher: bool,
-) -> ServeWorkerSpec:
+def _compute_spec_trainer_controller(instance: TrainerInstance) -> ServeWorkerSpec:
+    role = instance.role
     return ServeWorkerSpec(
         name=compute_trainer_controller_pool_id(role),
         deploy_component=DeployComponent.TRAINER,
+        deploy_instance=role,
         port_infos=[],
         env_var=lambda _ctx: {},
         scheduling=SchedulingSpec(
@@ -96,8 +184,8 @@ def _compute_spec_trainer_controller(
         worker_class=TRAINER_CONTROLLER_WORKER_CLASS,
         ctor_kwargs=lambda ctx: dict(
             role=role,
-            with_ref=with_ref,
-            with_opd_teacher=with_opd_teacher,
+            with_ref=instance.with_ref,
+            with_opd_teacher=instance.with_opd_teacher,
             cell_provider=ctx.capability.dynamic_worker_provider(pool_ids=[compute_trainer_pool_id(role)]),
             cell_operations=ctx.capability.cell_operations(),
         ),
@@ -105,35 +193,14 @@ def _compute_spec_trainer_controller(
 
 
 def specs_trainer(args) -> list[ServeWorkerSpec]:
-    specs = [
-        _compute_spec_trainer(
-            args,
-            role="actor",
-            num_nodes=args.actor_num_nodes,
-            num_gpus_per_node=args.actor_num_gpus_per_node,
-        )
-    ]
-    if args.use_critic:
-        specs.append(
-            _compute_spec_trainer(
-                compute_critic_args(args),
-                role="critic",
-                num_nodes=args.critic_num_nodes,
-                num_gpus_per_node=args.critic_num_gpus_per_node,
-            )
-        )
-    return specs
-
-
-def compute_trainer_pool_id(role: str) -> str:
-    return f"trainer-engine-{role}"
+    return [_compute_spec_trainer(instance) for instance in compute_deployed_trainer_instances(args)]
 
 
 def compute_trainer_num_cells(args, *, role: str) -> int:
     num_nodes, num_gpus_per_node = (
-        (args.actor_num_nodes, args.actor_num_gpus_per_node)
-        if role == "actor"
-        else (args.critic_num_nodes, args.critic_num_gpus_per_node)
+        (args.critic_num_nodes, args.critic_num_gpus_per_node)
+        if role == CRITIC_TRAINER_ROLE
+        else (args.actor_num_nodes, args.actor_num_gpus_per_node)
     )
     total_gpus = num_nodes * num_gpus_per_node
     return (total_gpus // compute_megatron_world_size_except_dp(args)) if args.indep_dp else 1
@@ -147,14 +214,11 @@ def compute_critic_args(args):
     return critic_args
 
 
-def _compute_spec_trainer(
-    args,
-    *,
-    role: str,
-    num_nodes: int,
-    num_gpus_per_node: int,
-) -> ServeWorkerSpec:
-    total_gpus = num_nodes * num_gpus_per_node
+def _compute_spec_trainer(instance: TrainerInstance) -> ServeWorkerSpec:
+    args = instance.args
+    role = instance.role
+    num_gpus_per_node = instance.num_gpus_per_node
+    total_gpus = instance.num_gpus
     num_cells = compute_trainer_num_cells(args, role=role)
     assert total_gpus % num_cells == 0, f"{total_gpus=} must be divisible by {num_cells=}"
     gpus_per_cell = total_gpus // num_cells
@@ -163,6 +227,7 @@ def _compute_spec_trainer(
         name=compute_trainer_pool_id(role),
         category=POOL_CATEGORY_TRAINER_ENGINE,
         deploy_component=DeployComponent.TRAINER,
+        deploy_instance=role,
         port_infos=[PortInfo(name=MASTER_PORT_NAME, static_port=9000, mode="master", allow_dynamic=True)],
         env_var=lambda ctx: compute_trainer_env_vars(args, ctx),
         scheduling=SchedulingSpec(
@@ -173,6 +238,7 @@ def _compute_spec_trainer(
             num_gpu_slots_per_worker=1,
             num_gpus_per_node=num_gpus_per_node,
             pg_name="actor",
+            pg_slot_offset=instance.gpu_offset,
         ),
         worker_class=_TRAINER_ACTOR_CLASSES[args.train_backend],
         ctor_kwargs=lambda ctx: dict(

@@ -9,7 +9,6 @@ register_cuda_ci(
     est_time=900,
     suite="stage-c-8-gpu-h100",
     labels=["short", "fully-async", "multi-policy"],
-    disabled="needs the M25 multi-instance trainer deployment (one trainer pool per policy model id)",
 )
 
 MODEL_NAME = "Qwen2.5-0.5B-Instruct"

@@ -82,6 +82,7 @@ class RolloutServer:
         lambda: ActiveAndEpoch(active=True, epoch=0)
     )
     expected_num_cells: int = 0
+    _disposed: bool = dataclasses.field(default=False, init=False)
 
     @property
     @requires_lock
@@ -114,9 +115,18 @@ class RolloutServer:
             await cell.probe_and_mark_dead()
 
     @requires_lock
-    async def add_cell(self, cell_meta: ServerCellMetadata):
-        cell_id = cell_meta.cell_id
-        assert cell_id not in self.server_cells
+    def remove_unreachable_cells(self) -> None:
+        for cell_id, cell in list(self.server_cells.items()):
+            if not cell.is_unreachable:
+                continue
+            logger.warning(
+                f"Cell {cell_id} of {self.model_name} failed its health checks, so its provider is told to forget "
+                f"it; it comes back as soon as that provider observes it again"
+            )
+            self.engine_provider.invalidate_cell(cell_id)
+
+    @lock_exempt
+    async def bring_up_cell(self, cell_meta: ServerCellMetadata) -> ServerCell:
         cell = ServerCell(
             args=self.args,
             router_api_client=self._router_api_client,
@@ -124,9 +134,31 @@ class RolloutServer:
             provider=self.engine_provider,
             global_health_checker_activeness=self.global_health_checker_activeness,
         )
-        self.server_cells[cell_id] = cell
-        if not self.args.colocate:
+        if self.args.colocate:
+            return cell
+        try:
             await cell.init()
+        except BaseException:
+            logger.error(
+                f"Cell {cell_meta.cell_id} of {self.model_name} did not initialize, so it never joins this run; its "
+                f"provider rolls it back too and announces it once more",
+                exc_info=True,
+            )
+            await dispose_uncommitted_cell(cell)
+            raise
+        return cell
+
+    @requires_lock
+    def commit_cell(self, cell: ServerCell) -> bool:
+        cell_id = cell.meta.cell_id
+        assert cell_id not in self.server_cells, (
+            f"cell {cell_id} of {self.model_name} is already in this run, and installing a second one would leave "
+            f"the engine the first one drives running with nothing tracking it"
+        )
+        if self._disposed:
+            return False
+        self.server_cells[cell_id] = cell
+        return True
 
     @requires_lock
     async def remove_cell(self, cell_id: str):
@@ -136,6 +168,7 @@ class RolloutServer:
 
     @requires_lock
     async def dispose(self) -> None:
+        self._disposed = True
         for cell_id in list(self.server_cells.keys()):
             await self.remove_cell(cell_id)
 
@@ -171,9 +204,10 @@ class RolloutServer:
     @lock_exempt
     async def wait_expected_num_cells(self, timeout: float = 3600):
         async def _check(remaining_seconds: float) -> None:
+            expected = self.total_expected_num_cells()
             count = self._count_startable_cells()
-            if count < self.expected_num_cells:
-                raise Exception(f"Only {count}/{self.expected_num_cells} cells of {self.model_name} are ready")
+            if count < expected:
+                raise Exception(f"Only {count}/{expected} cells of {self.model_name} are ready")
 
         await retry_until_deadline(
             _check,
@@ -185,12 +219,28 @@ class RolloutServer:
         )
 
     @lock_exempt
+    def total_expected_num_cells(self) -> int:
+        """The cells this deployment launches itself plus the ones other deployments register into it."""
+        return self.expected_num_cells + self.engine_provider.extra_expected_num_cells(model_id=self.model_name)
+
+    @lock_exempt
     def _count_startable_cells(self) -> int:
         if self.args.colocate:
             return len(self.server_cells)
         return sum(1 for cell in self.server_cells.values() if cell.is_pending_weights_or_serving)
 
     @property
-    @requires_lock
+    @lock_exempt
     def _router_api_client(self) -> SGLangRouterApiClient:
         return SGLangRouterApiClient(router_url=f"http://{self.router_ip}:{self.router_port}")
+
+
+async def dispose_uncommitted_cell(cell: ServerCell) -> None:
+    try:
+        await cell.dispose()
+    except Exception:
+        logger.error(
+            f"Disposing cell {cell.meta.cell_id}, which never joined this run, failed too, so its health checker "
+            f"may keep probing an engine nothing here drives",
+            exc_info=True,
+        )

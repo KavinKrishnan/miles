@@ -44,6 +44,7 @@ class _StubServer:
 
 def _make_controller(servers: dict, *, colocate: bool) -> InferenceController:
     controller = InferenceController.__new__(InferenceController)
+    controller._cell_reconcile_slots = {}
     controller.args = make_args(colocate=colocate)
     controller.servers = servers
     controller.context_lock = ContextLock("InferenceController")

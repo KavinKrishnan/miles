@@ -16,15 +16,23 @@ from miles.ray.specs import inference as inference_specs
 from miles.ray.specs.inference import (
     INFERENCE_CONTROLLER_POOL_ID,
     INFERENCE_CONTROLLER_WORKER_CLASS,
+    REGISTRATION_REPORTER_POOL_ID,
     _compute_router_primary_port_info,
     _compute_spec_router,
     compute_engine_pool_ids,
+    compute_inference_controller_provider,
     compute_inference_engine_env_vars,
+    compute_inference_instance_name,
+    compute_registration_external_hosts,
+    compute_registration_provider,
+    compute_registration_reporter,
     compute_router_pool_id,
     inference_controller_worker_name,
-    spec_inference_controller,
     spec_session_server,
+    specs_inference_controller,
     specs_inference_engine,
+    specs_registration_reporter,
+    specs_router,
 )
 from miles.rollout.session.config import SessionServerConfig
 from miles.router.config import MilesRouterConfig
@@ -32,7 +40,15 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.values.build
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import SECTION_OF_CATEGORY, LaunchPlan
 from miles.utils.function_registry import load_function
 from miles.utils.workers.argv_utils import parse_config_argv
-from miles.utils.workers.worker_spec import HostAndPort, LaunchCommandContext, WorkerCtorContext, WorkerMetaContext
+from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.worker_provider.fan_in import FanInWorkerProvider
+from miles.utils.workers.worker_spec import (
+    CommandWorkerSpec,
+    HostAndPort,
+    LaunchCommandContext,
+    WorkerCtorContext,
+    WorkerMetaContext,
+)
 
 
 def _controller_layout() -> LaunchPlan:
@@ -58,6 +74,10 @@ def _make_model_cfg(*worker_types: str) -> ModelConfig:
         for group_index, worker_type in enumerate(worker_types)
     ]
     return ModelConfig(name="default", model_path=None, server_groups=groups, update_weights=True)
+
+
+def _make_data_plane_router_spec(args, *, model_cfg: ModelConfig, model_idx: int = 0) -> CommandWorkerSpec:
+    return _compute_spec_router(args, model_idx=model_idx, model_cfg=model_cfg)
 
 
 def _make_router_ctx(*, port: int = 20000, prometheus_port: int = 4001) -> LaunchCommandContext:
@@ -100,8 +120,8 @@ class TestRouterPortPinning:
 class TestComputeSpecRouterLaunchCommand:
     def test_pd_disagg_with_miles_router_asserts(self):
         """Rendering a miles-router launch command for a PD-disaggregated model must fail fast."""
-        args = make_args(use_miles_router=True, sglang_router_ip=None, sglang_router_port=None)
-        spec = _compute_spec_router(args, model_idx=0, model_cfg=_make_model_cfg("prefill", "decode"))
+        args = make_args(use_miles_router=True, sglang_router_port=None)
+        spec = _make_data_plane_router_spec(args, model_cfg=_make_model_cfg("prefill", "decode"))
         with pytest.raises(AssertionError, match="miles router does not support PD"):
             spec.launch_command(_make_router_ctx())
 
@@ -111,7 +131,6 @@ class TestComputeSpecRouterLaunchCommand:
         discovery still reports a healthy prefill/decode fleet."""
         args = make_args(
             use_miles_router=False,
-            sglang_router_ip=None,
             sglang_router_port=None,
             rollout_external=True,
             rollout_external_router_pd=True,
@@ -124,7 +143,7 @@ class TestComputeSpecRouterLaunchCommand:
 
     def test_without_the_external_pd_flag_a_regular_model_keeps_a_regular_router(self):
         """Every internal run takes this path, and the new flag defaults to off."""
-        args = make_args(use_miles_router=False, sglang_router_ip=None, sglang_router_port=None)
+        args = make_args(use_miles_router=False, sglang_router_port=None)
         spec = _compute_spec_router(args, model_idx=0, model_cfg=_make_model_cfg("regular"))
 
         argv = shlex.split(spec.launch_command(_make_router_ctx()))
@@ -135,7 +154,6 @@ class TestComputeSpecRouterLaunchCommand:
         """The miles router cannot serve PD at all, so the external flag must hit the same guard."""
         args = make_args(
             use_miles_router=True,
-            sglang_router_ip=None,
             sglang_router_port=None,
             rollout_external=True,
             rollout_external_router_pd=True,
@@ -147,8 +165,8 @@ class TestComputeSpecRouterLaunchCommand:
 
     def test_sgl_router_launches_the_native_cli(self):
         """The sgl router runs as the upstream CLI with the addresses from the launch context."""
-        args = make_args(use_miles_router=False, sglang_router_ip=None, sglang_router_port=None)
-        spec = _compute_spec_router(args, model_idx=0, model_cfg=_make_model_cfg("regular"))
+        args = make_args(use_miles_router=False, sglang_router_port=None)
+        spec = _make_data_plane_router_spec(args, model_cfg=_make_model_cfg("regular"))
         argv = shlex.split(spec.launch_command(_make_router_ctx()))
         assert argv[0] == sys.executable
         assert argv[1:3] == ["-m", "sglang_router.launch_router"]
@@ -159,14 +177,13 @@ class TestComputeSpecRouterLaunchCommand:
         """The miles router command's config payload parses back losslessly."""
         args = make_args(
             use_miles_router=True,
-            sglang_router_ip=None,
             sglang_router_port=None,
             miles_router_max_connections=100,
             miles_router_timeout=None,
             miles_router_health_check_failure_threshold=3,
             rollout_health_check_interval=10.0,
         )
-        spec = _compute_spec_router(args, model_idx=0, model_cfg=_make_model_cfg("regular"))
+        spec = _make_data_plane_router_spec(args, model_cfg=_make_model_cfg("regular"))
         argv = shlex.split(spec.launch_command(_make_router_ctx()))
         assert argv[:3] == [sys.executable, "-m", "miles.router.router"]
         config = parse_config_argv(MilesRouterConfig, argv[3:])
@@ -182,7 +199,6 @@ class TestComputeSpecSessionServer:
             use_session_server=True,
             hf_checkpoint="/fake/model",
             num_session_servers=2,
-            sglang_router_ip=None,
             sglang_router_port=None,
             miles_router_timeout=None,
             chat_template_path=None,
@@ -300,8 +316,6 @@ class TestInferenceSpecPinToHead:
     @pytest.mark.parametrize("pinned", [False, True])
     def test_router_and_session_specs_follow_the_rollout_manager_flag(self, pinned: bool):
         """Both driver-adjacent specs are pinned exactly when the rollout manager is."""
-        from miles.ray.specs.inference import _compute_spec_router, spec_session_server
-
         args = make_args(
             pin_rollout_manager_to_head=pinned,
             use_miles_router=False,
@@ -321,7 +335,7 @@ class TestInferenceSpecPinToHead:
             miles_router_timeout=None,
         )
 
-        router = _compute_spec_router(args, model_idx=0, model_cfg=_make_model_cfg("regular"))
+        router = _make_data_plane_router_spec(args, model_cfg=_make_model_cfg("regular"))
         session = spec_session_server(args)
 
         assert router.scheduling.pin_to_head is pinned
@@ -595,7 +609,7 @@ class TestSpecInferenceController:
 
     def test_every_run_gets_exactly_one_gpuless_controller(self, tmp_path):
         """It is a control-plane worker on both backends; a gpu request would reserve a whole node for it."""
-        spec = spec_inference_controller(self._args(tmp_path))
+        (spec,) = specs_inference_controller(self._args(tmp_path))
 
         assert spec.name == INFERENCE_CONTROLLER_POOL_ID
         assert (spec.scheduling.num_cells, spec.scheduling.num_workers_per_cell) == (1, 1)
@@ -604,7 +618,7 @@ class TestSpecInferenceController:
 
     def test_the_worker_class_is_the_controller_itself(self, tmp_path):
         """The spec names the class a pod or actor constructs, so it must be the real implementation."""
-        spec = spec_inference_controller(self._args(tmp_path))
+        (spec,) = specs_inference_controller(self._args(tmp_path))
 
         assert load_function(spec.worker_class) is InferenceController
 
@@ -614,7 +628,7 @@ class TestSpecInferenceController:
 
     def test_it_renders_into_static_workers_with_its_rpc_port(self, tmp_path):
         """The release has to contain the controller pod, or the address book would point at nothing."""
-        spec = spec_inference_controller(self._args(tmp_path))
+        (spec,) = specs_inference_controller(self._args(tmp_path))
 
         values = build_values([spec], _controller_layout()).as_values()
 
@@ -630,7 +644,8 @@ class TestSpecInferenceController:
         args = self._args(tmp_path)
         capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
 
-        kwargs = spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+        (spec,) = specs_inference_controller(args)
+        kwargs = spec.ctor_kwargs(self._ctor_context(capability))
 
         assert capability.requested_pool_ids == [compute_engine_pool_ids(args)]
         assert kwargs["engine_provider"] is capability.cells_provider
@@ -639,7 +654,8 @@ class TestSpecInferenceController:
         """Every model is served by its own router pool, so one provider cannot answer for all of them."""
         capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
 
-        kwargs = spec_inference_controller(self._args(tmp_path)).ctor_kwargs(self._ctor_context(capability))
+        (spec,) = specs_inference_controller(self._args(tmp_path))
+        kwargs = spec.ctor_kwargs(self._ctor_context(capability))
 
         assert capability.requested_static_pool_ids == [compute_router_pool_id(0)]
         assert kwargs["router_providers"] == [capability.static_provider]
@@ -649,7 +665,8 @@ class TestSpecInferenceController:
         args = self._args(tmp_path, debug_train_only=True)
         capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
 
-        spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+        (spec,) = specs_inference_controller(args)
+        spec.ctor_kwargs(self._ctor_context(capability))
 
         assert capability.requested_pool_ids == [[]]
 
@@ -668,7 +685,8 @@ class TestSpecInferenceController:
             external_engine_provider_module, "StaticInferenceEngineWorkerProvider", _RecordingStaticProvider
         )
 
-        kwargs = spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+        (spec,) = specs_inference_controller(args)
+        kwargs = spec.ctor_kwargs(self._ctor_context(capability))
 
         assert isinstance(kwargs["engine_provider"], _RecordingStaticProvider)
         assert kwargs["engine_provider"].args is args
@@ -684,7 +702,8 @@ class TestSpecInferenceController:
         )
         capability = FakeBackendCapability(cells_provider=None, static_provider=object())
 
-        kwargs = spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+        (spec,) = specs_inference_controller(args)
+        kwargs = spec.ctor_kwargs(self._ctor_context(capability))
 
         assert kwargs["engine_provider"] == ("custom-provider", args, capability)
 
@@ -702,3 +721,177 @@ class TestTheEngineEnvironment:
     def test_every_engine_is_told_to_report_its_own_env_vars(self) -> None:
         """Without the gate the engine answers /server_info with no env_vars, and the audit is empty."""
         assert compute_inference_engine_env_vars(make_args())["SGLANG_EXPOSE_OWN_ENV_VARS"] == "1"
+
+
+def _make_two_model_args(tmp_path, **overrides) -> Namespace:
+    config_path = tmp_path / "sglang.yaml"
+    config_path.write_text(
+        "sglang:\n"
+        "  - name: actor\n"
+        "    server_groups:\n"
+        "      - worker_type: regular\n"
+        "        num_gpus: 4\n"
+        "        num_gpus_per_engine: 2\n"
+        "  - name: ref\n"
+        "    model_path: /fake/ref-model\n"
+        "    update_weights: false\n"
+        "    server_groups:\n"
+        "      - worker_type: regular\n"
+        "        num_gpus: 4\n"
+        "        num_gpus_per_engine: 4\n"
+    )
+    return make_args(sglang_config=str(config_path), rollout_num_gpus=8, **overrides)
+
+
+class TestEngineOnlyDeployment:
+    def test_a_named_inference_deployment_builds_no_controller_and_no_router(self, tmp_path):
+        """The engines of another datacenter join the one controller of the run; a second one would split it."""
+        args = _make_two_model_args(tmp_path, deploy_component="inference:east")
+
+        assert specs_inference_controller(args) == []
+        assert specs_router(args) == []
+
+    def test_the_unnamed_inference_deployment_still_builds_both(self, tmp_path):
+        """A run that deploys its inference side as one piece is unchanged by multi-datacenter support."""
+        args = _make_two_model_args(tmp_path)
+
+        assert [spec.name for spec in specs_inference_controller(args)] == [INFERENCE_CONTROLLER_POOL_ID]
+        assert [spec.name for spec in specs_router(args)] == [compute_router_pool_id(index) for index in range(2)]
+
+    def test_only_a_named_inference_deployment_runs_a_reporter(self, tmp_path):
+        """A deployment that owns the controller registers nothing; it is the one that is registered into."""
+        assert specs_registration_reporter(_make_two_model_args(tmp_path)) == []
+
+        (spec,) = specs_registration_reporter(_make_two_model_args(tmp_path, deploy_component="inference:east"))
+
+        assert spec.name == REGISTRATION_REPORTER_POOL_ID
+        assert spec.deploy_component is DeployComponent.INFERENCE
+        assert spec.deploy_instance == "east"
+        assert spec.scheduling.num_gpus_per_worker == 0
+
+
+class TestComputeInferenceInstanceName:
+    def test_a_named_deployment_is_its_own_instance(self):
+        """The deployment name is the pool namespace and the reporter id, so it comes from one place."""
+        assert compute_inference_instance_name(make_args(deploy_component="inference:east")) == "east"
+
+    def test_an_unnamed_deployment_has_no_instance(self):
+        """A run that deploys its inference side as one piece registers nothing anywhere."""
+        assert compute_inference_instance_name(make_args()) is None
+
+
+class TestComputeRegistrationProvider:
+    def test_a_run_that_expects_no_reporter_builds_no_registry(self):
+        """Single-datacenter runs must behave exactly as they did before registration existed."""
+        assert compute_registration_provider(make_args()) is None
+
+    def test_a_run_that_expects_reporters_builds_a_registry_holding_its_token(self):
+        """The registry authenticates every snapshot, so it has to be given the run's shared secret."""
+        args = make_args(expected_registration_reporters=2, registration_token="secret")
+
+        provider = compute_registration_provider(args)
+
+        assert provider is not None
+        assert provider.reporter_ids() == []
+        assert provider._token == "secret"
+
+    def test_the_controller_observes_the_local_engines_and_the_registered_ones(self, tmp_path):
+        """A registered cell has to reach the same reconcile path as a locally launched one."""
+        args = _make_two_model_args(tmp_path, expected_registration_reporters=1)
+        capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
+
+        (spec,) = specs_inference_controller(args)
+        kwargs = spec.ctor_kwargs(
+            WorkerCtorContext(cell_index=0, worker_in_cell_index=0, gpu_ids=[], capability=capability)
+        )
+
+        assert isinstance(kwargs["engine_provider"], FanInWorkerProvider)
+        assert kwargs["registration_provider"] is not None
+
+
+class TestComputeRegistrationReporter:
+    def _reporter(self, tmp_path, **overrides) -> object:
+        args = _make_two_model_args(
+            tmp_path,
+            deploy_component="inference:east",
+            inference_controller_addrs=["http://10.0.0.4:8000"],
+            **overrides,
+        )
+        capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
+        return compute_registration_reporter(args, instance_name="east", capability=capability)
+
+    def test_it_reports_under_the_name_of_its_own_deployment(self, tmp_path):
+        """The run tells its reporters apart by that name, and their pool ids are namespaced by it."""
+        reporter = self._reporter(tmp_path)
+
+        assert reporter._reporter_id == "east"
+        assert reporter._pool_id_prefix == "east"
+
+    def test_it_declares_how_many_cells_of_each_model_it_will_bring(self, tmp_path):
+        """The run's startup barrier waits for those cells instead of passing on the local ones alone."""
+        reporter = self._reporter(tmp_path)
+
+        assert reporter._expected_num_cells_by_model == {"actor": 2, "ref": 1}
+
+    def test_it_carries_the_shared_token(self, tmp_path):
+        """The registration endpoint is reachable across datacenters, so every snapshot authenticates."""
+        reporter = self._reporter(tmp_path, registration_token="secret")
+
+        assert reporter._token == "secret"
+
+    def test_a_restarted_controller_is_dialed_through_a_fresh_handle(self, tmp_path):
+        """A handle still pinning the dead incarnation's boot uuid would freeze this deployment out for good."""
+        reporter = self._reporter(tmp_path)
+
+        assert reporter._create_controller() is not reporter._controller
+
+
+class TestRegistrationExternalHosts:
+    def test_a_deployment_without_translations_reports_what_it_observes(self):
+        """The addresses may already be reachable, and then there is nothing to rewrite."""
+        assert compute_registration_external_hosts(make_args()) == {}
+
+    def test_entries_are_read_as_host_to_external_host(self):
+        """A cluster-internal address means nothing in the datacenter that dials it."""
+        args = make_args(registration_external_hosts=["10.0.0.5=engine-east.example", "10.0.0.6=engine2.example"])
+
+        assert compute_registration_external_hosts(args) == {
+            "10.0.0.5": "engine-east.example",
+            "10.0.0.6": "engine2.example",
+        }
+
+    def test_an_entry_that_names_no_translation_is_refused(self):
+        """Half a rule would silently leave an unreachable address in every snapshot."""
+        args = make_args(registration_external_hosts=["10.0.0.5"])
+
+        with pytest.raises(AssertionError, match="registration-external-hosts"):
+            compute_registration_external_hosts(args)
+
+
+class TestComputeInferenceControllerProvider:
+    def test_named_addrs_are_resolved_without_asking_the_backend(self):
+        """An independently deployed controller belongs to no backend of this run."""
+        args = make_args(inference_controller_addrs=["http://10.0.0.4:8000"])
+        capability = FakeBackendCapability(static_provider=object())
+
+        provider = compute_inference_controller_provider(args, capability=capability)
+
+        assert capability.requested_static_pool_ids == []
+        assert provider.get_handle(inference_controller_worker_name()) is not None
+
+    def test_several_named_controllers_are_refused(self):
+        """A run drives exactly one controller, and every other engine deployment registers into it."""
+        args = make_args(inference_controller_addrs=["http://10.0.0.4:8000", "http://10.0.0.5:8000"])
+        capability = FakeBackendCapability(static_provider=object())
+
+        with pytest.raises(AssertionError, match="exactly one of them"):
+            compute_inference_controller_provider(args, capability=capability)
+
+    def test_without_named_addrs_the_backend_answers(self):
+        """The controller of an ordinary run is a worker of that run's own release."""
+        capability = FakeBackendCapability(static_provider=object())
+
+        provider = compute_inference_controller_provider(make_args(), capability=capability)
+
+        assert capability.requested_static_pool_ids == [INFERENCE_CONTROLLER_POOL_ID]
+        assert provider is capability.static_provider

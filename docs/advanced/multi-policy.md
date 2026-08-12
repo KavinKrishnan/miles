@@ -8,9 +8,10 @@ data source and one rollout executor.
 
 <Warning>
 
-**Status.** Under active development. The training semantics below are in place; deploying more than
-one trainer instance (one trainer pool per policy) is the split/multi-instance deployment work and is
-not finished yet, so a real multi policy launch is not usable end to end today.
+**Status.** Under active development. The training semantics below are in place and a multi policy
+launch runs end to end - the two gpu e2e tests for it are enabled. Deploying each policy's trainer as
+a release of its own is described in
+[multi instance deployment](/advanced/multi-instance-deployment).
 
 </Warning>
 
@@ -149,6 +150,8 @@ bubble that grows with how far apart the policies are running.
 - Multi policy requires `--sglang-config`, with one updatable inference model per policy.
 - `--use-critic` and `--colocate` are not supported.
 - The orchestration script is `train_multi_policy.py`.
+- Every policy's trainer is addressed by its model id, and may be installed as a release of its own;
+  see [multi instance deployment](/advanced/multi-instance-deployment).
 - Evaluation is not supported. `train_multi_policy.py` has no eval dispatcher, so `--eval-interval`
   is rejected rather than accepted and ignored; convergence is read from the per policy training
   curves.
