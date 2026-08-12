@@ -14,6 +14,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.utils.multi_lora import EmptyBatchTimeoutError
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
 
 
@@ -64,7 +65,12 @@ class _NeverUsedProvider:
 
 
 async def _make_executor(args):
-    executor = RolloutExecutor(args=args, router_providers=[_NeverUsedProvider()], session_server_provider=None)
+    executor = RolloutExecutor(
+        args=args,
+        router_providers=[_NeverUsedProvider()],
+        session_server_provider=None,
+        inference_controller_provider=_NeverUsedProvider(),
+    )
     await executor.init()
     return executor
 
@@ -147,7 +153,8 @@ class TestGenerate:
         assert len(captured) == 1
         assert isinstance(captured[0], RolloutFnTrainInput)
         assert captured[0].rollout_id == 42
-        assert set(result) == {"sample_indices", "data_ref"}
+        assert set(result) == {"sample_indices", "data_ref", "empty_batch_timeout"}
+        assert result["empty_batch_timeout"] is False
         data_refs = result["data_ref"]
         assert len(data_refs) == 2
         partitions = ray.get([box.inner for box in data_refs])
@@ -156,6 +163,25 @@ class TestGenerate:
             assert "rewards" in partition
             assert "loss_masks" in partition
             assert len(partition["tokens"]) == 4
+
+    async def test_an_empty_batch_timeout_is_reported_as_a_field_rather_than_an_exception(
+        self, ray_local_mode, patch_low_level
+    ):
+        """Under rpc a remote exception arrives as RpcWorkerCallError, so the multi-LoRA driver reads a field."""
+        args = _make_test_args()
+        args.global_batch_size = 8
+
+        executor = await _make_executor(args)
+        executor.set_train_parallel_config({"dp_size": 2})
+
+        def timing_out_rollout_fn(input):
+            raise EmptyBatchTimeoutError("no trainable group arrived")
+
+        executor.generate_rollout = timing_out_rollout_fn
+
+        result = await executor.get(rollout_id=11)
+
+        assert result == dict(sample_indices=None, data_ref=None, empty_batch_timeout=True)
 
     async def test_rejects_samples_generated_under_the_default_weight_version(self, ray_local_mode, patch_low_level):
         """A batch carrying the sglang never-updated version must fail get(), not reach training."""

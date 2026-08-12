@@ -7,6 +7,7 @@ import httpx
 from pydantic import BaseModel
 
 from miles.utils.http_utils import GeneralHttpClientProvider
+from miles.utils.retry_utils import NonRetryableError
 from miles.utils.workers.rpc.common.protocol import (
     BOOT_UUID_HEADER,
     BOOT_UUID_MISMATCH_STATUS,
@@ -34,6 +35,10 @@ class RpcProtocolError(Exception):
 
 
 class RpcWorkerCallError(Exception):
+    pass
+
+
+class NonRetryableRpcWorkerCallError(RpcWorkerCallError, NonRetryableError):
     pass
 
 

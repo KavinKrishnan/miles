@@ -1,3 +1,4 @@
+import base64
 import os
 from abc import ABC, abstractmethod
 from argparse import Namespace
@@ -5,10 +6,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from types import TracebackType
-from typing import Any
+from typing import Annotated, Any
 
 import ray
-from pydantic import ConfigDict
+import ray._private.internal_api
+from pydantic import BeforeValidator, ConfigDict, PlainSerializer
 
 from miles.utils.pydantic_utils import StrictBaseModel
 
@@ -34,10 +36,36 @@ class ObjectStoreBackend(Enum):
     MOONCAKE = "mooncake"
 
 
+RAY_OBJECT_REF_TAG = "__miles_ray_object_ref__"
+
+_CLOUDPICKLED_REF_BINARIES: set[bytes] = set()
+
+
+def _encode_payload(payload: Any) -> Any:
+    if not isinstance(payload, ray.ObjectRef):
+        return payload
+    return {RAY_OBJECT_REF_TAG: base64.b64encode(ray.cloudpickle.dumps(payload)).decode()}
+
+
+def _decode_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict) or (encoded := payload.get(RAY_OBJECT_REF_TAG)) is None:
+        return payload
+    ref = ray.cloudpickle.loads(base64.b64decode(encoded))
+    _CLOUDPICKLED_REF_BINARIES.add(ref.binary())
+    return ref
+
+
+def _was_decoded_from_the_wire(payload: Any) -> bool:
+    return isinstance(payload, ray.ObjectRef) and payload.binary() in _CLOUDPICKLED_REF_BINARIES
+
+
+WirePayload = Annotated[Any, BeforeValidator(_decode_payload), PlainSerializer(_encode_payload)]
+
+
 class StoreObjectRef(StrictBaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
-    payload: Any
+    payload: WirePayload
 
 
 @dataclass(frozen=True)
@@ -126,7 +154,10 @@ class RayObjectStore(BaseObjectStore):
         return ObjectStoreGetResult(value=ray.get(ref.payload), release_fn=_release_noop)
 
     def remove(self, ref: StoreObjectRef) -> None:
-        pass
+        if not _was_decoded_from_the_wire(ref.payload):
+            return
+        _CLOUDPICKLED_REF_BINARIES.discard(ref.payload.binary())
+        ray._private.internal_api.free([ref.payload])
 
 
 def _release_noop(value: Any) -> None:

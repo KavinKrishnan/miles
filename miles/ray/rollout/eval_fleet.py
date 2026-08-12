@@ -1,21 +1,56 @@
 """The dedicated in-job eval engines (``--eval-num-gpus``).
 
-Weight delivery only: ``pin`` loads a snapshot onto every engine, verifies each one
-reports the expected version, and hands back the state to generate against. Who
-generates is the eval fn's business, exactly as on the training engines.
+Weight delivery only: ``pin`` loads a snapshot onto every engine and verifies each
+one reports the expected version. The fleet lives beside its engines, in the
+inference controller; the executor holds an ``EvalFleetSession`` over the wire and
+builds the state to generate against from the fleet's description. Who generates is
+the eval fn's business, exactly as on the training engines.
 """
 
 import asyncio
+import dataclasses
 import logging
 from argparse import Namespace
 
 from miles.rollout.checkpoint_eval import EvalSkip, retarget_args
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
 from miles.utils.http_utils import wait_http_ok
+from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_spec import HostAndPort
 
 logger = logging.getLogger(__name__)
 
 EVAL_WEIGHT_LOAD_TIMEOUT_SECS = 600.0
+
+
+@dataclasses.dataclass(frozen=True)
+class EvalFleetInfo:
+    router: HostAndPort
+    num_gpus: int
+    num_gpus_per_engine: int
+
+
+@dataclasses.dataclass(frozen=True)
+class EvalFleetPin:
+    skip_reason: str | None
+
+
+class EvalFleetSession:
+    """The executor's side of the fleet: one state to generate against, pinned over rpc."""
+
+    def __init__(self, args: Namespace, *, info: EvalFleetInfo, inference_controller: BaseWorkerHandle) -> None:
+        self._inference_controller = inference_controller
+        self._state = GenerateState(
+            retarget_args(args, info.router.host, info.router.port, info.num_gpus, info.num_gpus_per_engine)
+        )
+
+    async def pin(self, checkpoint_dir: str, weight_version: str) -> GenerateState:
+        pin = await self._inference_controller.pin_eval_fleet(
+            checkpoint_dir=checkpoint_dir, weight_version=weight_version
+        )
+        if (skip_reason := pin.skip_reason) is not None:
+            raise EvalSkip(skip_reason)
+        return self._state
 
 
 class EvalFleet:
@@ -24,12 +59,19 @@ class EvalFleet:
     def __init__(self, args: Namespace, *, srv):
         self.args = args
         self._srv = srv
-        self._state = GenerateState(self._fleet_args())
 
-    async def pin(self, checkpoint_dir: str, weight_version: str) -> GenerateState:
-        """Load the snapshot onto every engine, then return the state to generate against.
+    @property
+    def info(self) -> EvalFleetInfo:
+        return EvalFleetInfo(
+            router=HostAndPort(host=self._srv.router_ip, port=self._srv.router_port),
+            num_gpus=self.args.eval_num_gpus,
+            num_gpus_per_engine=self.args.eval_num_gpus_per_engine,
+        )
 
-        On the manager's event loop: keep everything here awaiting rather than blocking.
+    async def pin(self, checkpoint_dir: str, weight_version: str) -> EvalFleetPin:
+        """Load the snapshot onto every engine, then report whether it can be generated against.
+
+        On the controller's event loop: keep everything here awaiting rather than blocking.
         """
         try:
             if not self.args.use_fault_tolerance:
@@ -39,24 +81,18 @@ class EvalFleet:
             await self._srv.wait_all_engines_alive()
         except Exception as e:
             logger.warning(f"Eval fleet unhealthy: {e}")
-            raise EvalSkip("unhealthy") from e
+            return EvalFleetPin(skip_reason="unhealthy")
 
         if not await self._pin_fleet(checkpoint_dir, weight_version):
-            raise EvalSkip("pin_violation")
+            return EvalFleetPin(skip_reason="pin_violation")
 
         try:
             await self._wait_router_ready()
         except Exception as e:
             logger.warning(f"Eval router not ready: {e}")
-            raise EvalSkip("unhealthy") from e
+            return EvalFleetPin(skip_reason="unhealthy")
 
-        return self._state
-
-    def _fleet_args(self) -> Namespace:
-        router_ip, router_port = self.args.sglang_model_routers["eval"]
-        return retarget_args(
-            self.args, router_ip, router_port, self.args.eval_num_gpus, self.args.eval_num_gpus_per_engine
-        )
+        return EvalFleetPin(skip_reason=None)
 
     async def _pin_fleet(self, checkpoint_dir: str, weight_version: str, *, retries: int = 2) -> bool:
         """Load the snapshot into every fleet engine and confirm all report

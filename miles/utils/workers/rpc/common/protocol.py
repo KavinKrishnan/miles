@@ -31,6 +31,7 @@ class CallStatusResponse(StrictBaseModel):
     status: Literal["pending", "success", "failed"]
     result: Any = None
     error: str | None = None
+    non_retryable: bool = False
 
 
 class HealthResponse(StrictBaseModel):

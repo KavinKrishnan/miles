@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import ray
@@ -20,9 +21,12 @@ from miles.utils.workers.backend_capability.ray import RayBackendCapability
 from miles.utils.workers.command_actor import CommandActor
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
 from miles.utils.workers.ray_worker_handle import RayWorkerHandle
+from miles.utils.workers.serving.serve_actor import ServeActor
+from miles.utils.workers.types import WorkerCommBackend
 from miles.utils.workers.worker_info import WorkerInfo
 from miles.utils.workers.worker_provider.base import CellInfo
 from miles.utils.workers.worker_spec import (
+    RPC_PORT_NAME,
     BaseWorkerSpec,
     CommandWorkerSpec,
     HostAndPort,
@@ -47,20 +51,35 @@ _ACTOR_NAME = "ray_worker_manager"
 class RayWorkerManager:
     def __init__(self):
         self.port_allocator = PortAllocator()
+        self.comm_backend = WorkerCommBackend.RAY
 
     @staticmethod
-    def launch(args, specs: list[BaseWorkerSpec], pgs: dict[str, PlacementGroupInfo]):
+    def launch(
+        args,
+        specs: list[BaseWorkerSpec],
+        pgs: dict[str, PlacementGroupInfo],
+        *,
+        comm_backend: WorkerCommBackend = WorkerCommBackend.RAY,
+    ):
         obj = ray.remote(RayWorkerManager).options(name=_ACTOR_NAME).remote()
-        ray.get(obj.init.remote(args, specs, pgs))
+        ray.get(obj.init.remote(args, specs, pgs, comm_backend=comm_backend))
         return obj
 
     @staticmethod
     def get_handle() -> ray.actor.ActorHandle:
         return ray.get_actor(_ACTOR_NAME)
 
-    async def init(self, args, specs: list[BaseWorkerSpec], pgs: dict[str, PlacementGroupInfo]):
+    async def init(
+        self,
+        args,
+        specs: list[BaseWorkerSpec],
+        pgs: dict[str, PlacementGroupInfo],
+        *,
+        comm_backend: WorkerCommBackend = WorkerCommBackend.RAY,
+    ):
         configure_logger(args, source=SimpleProcessIdentity(component="worker_manager"))
 
+        self.comm_backend = comm_backend
         self.pgs = pgs
         self._pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
         assert len(self._pools) == len(specs)
@@ -99,17 +118,7 @@ class RayWorkerManager:
         return {name: [a.self_addrs for c in g.cells if c.alive for a in c.actors] for name, g in self._pools.items()}
 
     def get_worker_infos(self, cell_id: str) -> list[WorkerInfo]:
-        cell = self._find_cell(cell_id)
-        return [
-            WorkerInfo(
-                name=actor.name,
-                generation=actor.generation,
-                self_addrs=actor.self_addrs,
-                gpu_ids=actor.gpu_ids,
-                handle=RayWorkerHandle(actor.actor_handle),
-            )
-            for actor in cell.actors
-        ]
+        return [self._compute_worker_info(actor) for actor in self._find_cell(cell_id).actors]
 
     def get_cell_infos(self, *, pool_ids: list[str]) -> dict[str, CellInfo]:
         # TODO: about `get_worker_infos` (which is only used by dashboard)
@@ -117,6 +126,21 @@ class RayWorkerManager:
         assert not unknown, f"{unknown=} {sorted(self._pools)=}"
         infos = [c.get_info() for name in pool_ids for c in self._pools[name].cells]
         return {info.cell_id: info for info in infos}
+
+    @property
+    def speaks_rpc(self) -> bool:
+        return self.comm_backend == WorkerCommBackend.RPC
+
+    def _compute_worker_info(self, actor: _BaseActorManager) -> WorkerInfo:
+        served_over_rpc = isinstance(actor.spec, ServeWorkerSpec) and self.speaks_rpc
+        return WorkerInfo(
+            name=actor.name,
+            generation=actor.generation,
+            self_addrs=actor.self_addrs,
+            gpu_ids=actor.gpu_ids,
+            handle=None if served_over_rpc else RayWorkerHandle(actor.actor_handle),
+            worker_class=actor.spec.worker_class if served_over_rpc else None,
+        )
 
     def _find_actor(self, worker_name: str) -> _BaseActorManager:
         matches = [a for c in self._all_cells() if c.alive for a in c.actors if a.name == worker_name]
@@ -357,9 +381,23 @@ class _CommandActorManager(_BaseActorManager[CommandWorkerSpec]):
 class _ServeActorManager(_BaseActorManager[ServeWorkerSpec]):
     def _compute_remote_options(self) -> dict:
         groups = self.spec.concurrency_groups
-        return {} if groups is None else dict(concurrency_groups=groups)
+        if groups is None or self.manager.speaks_rpc:
+            return {}
+        return dict(concurrency_groups=groups)
 
     async def launch_actor(self) -> None:
+        if self.manager.speaks_rpc:
+            self.actor_handle = self._create_actor(
+                ServeActor,
+                build_worker=partial(
+                    build_serve_worker,
+                    worker_class_path=self.spec.worker_class,
+                    ctor_kwargs=self.spec.ctor_kwargs,
+                    context=self.launch_context,
+                ),
+            )
+            return
+
         self.actor_handle = self._create_actor(
             bootstrapped_worker_class(self.spec.worker_class),
             ctor_kwargs=self.spec.ctor_kwargs,
@@ -367,7 +405,15 @@ class _ServeActorManager(_BaseActorManager[ServeWorkerSpec]):
         )
 
     async def post_setup(self) -> None:
-        pass
+        if not self.manager.speaks_rpc:
+            return
+        await self.actor_handle.start_rpc_server.remote(port=self.self_addrs[RPC_PORT_NAME].port)
+
+
+def build_serve_worker(
+    *, worker_class_path: str, ctor_kwargs: Callable[[WorkerCtorContext], dict[str, Any]], context: WorkerLaunchContext
+) -> Any:
+    return bootstrapped_worker_class(worker_class_path)(ctor_kwargs=ctor_kwargs, context=context)
 
 
 def bootstrapped_worker_class(worker_class_path: str) -> type:

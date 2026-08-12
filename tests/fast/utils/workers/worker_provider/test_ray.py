@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from miles.utils.workers.worker_info import WorkerInfo
 from miles.utils.workers.worker_provider.base import CellInfo
 from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 from miles.utils.workers.worker_spec import HostAndPort
@@ -242,6 +243,82 @@ class TestRayWorkerProviderWatchCellsPolling:
             assert ("cell-a", info_a) in reconciler.calls
         finally:
             await stop()
+
+
+class _RpcDemoWorker:
+    def report(self) -> str:
+        return "ok"
+
+
+_RPC_DEMO_WORKER_PATH = f"{__name__}._RpcDemoWorker"
+
+
+@dataclass
+class _FakeWorkerInfosMethod:
+    answers: list[list[WorkerInfo]]
+    calls: list[str] = field(default_factory=list)
+
+    def remote(self, cell_id: str) -> Any:
+        self.calls.append(cell_id)
+        return _resolved_infos(self.answers[min(len(self.calls) - 1, len(self.answers) - 1)])
+
+
+@dataclass
+class _ServingManagerHandle:
+    get_worker_infos: _FakeWorkerInfosMethod
+
+
+async def _resolved_infos(value: list[WorkerInfo]) -> list[WorkerInfo]:
+    return value
+
+
+def _served_worker_info(*, generation: int, port: int = 15000) -> WorkerInfo:
+    return WorkerInfo(
+        name="trainer-engine-actor-0-0",
+        generation=generation,
+        self_addrs={"rpc": HostAndPort(host="10.0.0.7", port=port)},
+        gpu_ids=[],
+        handle=None,
+        worker_class=_RPC_DEMO_WORKER_PATH,
+    )
+
+
+class TestRayWorkerProviderRpcHandles:
+    async def test_the_same_worker_keeps_one_handle(self):
+        """A handle rebuilt per lookup re-handshakes its boot uuid, so a restart stops being detectable."""
+        info = _served_worker_info(generation=0)
+        handle = _ServingManagerHandle(get_worker_infos=_FakeWorkerInfosMethod(answers=[[info]]))
+        provider = RayWorkerProvider(worker_manager_handle=handle, pool_ids=["trainer-engine-actor"])
+
+        first = await provider.get_handle_async("trainer-engine-actor-0-0")
+        second = await provider.get_handle_async("trainer-engine-actor-0-0")
+
+        assert first is second
+
+    async def test_a_relaunched_worker_gets_a_new_handle(self):
+        """A new generation is a new process at a new address, and its predecessor's pin no longer applies."""
+        handle = _ServingManagerHandle(
+            get_worker_infos=_FakeWorkerInfosMethod(
+                answers=[[_served_worker_info(generation=0)], [_served_worker_info(generation=1, port=15001)]]
+            )
+        )
+        provider = RayWorkerProvider(worker_manager_handle=handle, pool_ids=["trainer-engine-actor"])
+
+        first = await provider.get_handle_async("trainer-engine-actor-0-0")
+        second = await provider.get_handle_async("trainer-engine-actor-0-0")
+
+        assert first is not second
+
+    async def test_the_worker_of_the_named_cell_is_asked_for(self):
+        """The async lookup derives its cell exactly like the blocking one, or it would drive another cell."""
+        handle = _ServingManagerHandle(
+            get_worker_infos=_FakeWorkerInfosMethod(answers=[[_served_worker_info(generation=0)]])
+        )
+        provider = RayWorkerProvider(worker_manager_handle=handle, pool_ids=["trainer-engine-actor"])
+
+        await provider.get_handle_async("trainer-engine-actor-0-0")
+
+        assert handle.get_worker_infos.calls == ["trainer-engine-actor-0"]
 
 
 class TestRayWorkerProviderWatchCellsStop:

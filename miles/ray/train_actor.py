@@ -2,27 +2,31 @@ import abc
 import logging
 import os
 import random
+from argparse import Namespace
 from datetime import timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import Any, Literal
 
 import ray
 import torch
 import torch.distributed as dist
 
 import miles.utils.eval_config
+from miles.backends.megatron_utils.ft.types import TrainStepOutput
+from miles.ray.rollout.updatable_engines import UpdatableEngines
 from miles.utils import object_store
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
+from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.distributed_utils import init_gloo_group
 from miles.utils.ft_utils.heartbeat_utils import HeartbeatStatus, SimpleHeartbeat
+from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.logging_utils import configure_logger
 from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
+from miles.utils.object_store import StoreObjectRef
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
 from miles.utils.test_utils.fault_injector import inject_fault as _inject_fault
-
-if TYPE_CHECKING:
-    from miles.ray.rollout.inference_controller import UpdatableEngines
-
+from miles.utils.workers.rpc.common.metadata import rpc
+from miles.utils.workers.rpc.common.wire_types import Pickled
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,21 @@ class TrainRayActor(NodeProbeMixin):
         os.environ["MASTER_PORT"] = str(master_port)
 
     # TODO mv the args into ctor
-    def init(self, args, role, with_ref=False, with_opd_teacher=False):
+    @abc.abstractmethod
+    def init(
+        self,
+        args: Pickled,
+        role: str,
+        *,
+        with_ref: bool = False,
+        with_opd_teacher: bool = False,
+        recv_ckpt_src_rank: int | None = None,
+        indep_dp_info: IndepDPInfo,
+        indep_dp_store_addr: str | None,
+    ) -> int | None:
+        raise NotImplementedError
+
+    def _init_common(self, args: Namespace, role: str, with_ref: bool = False, with_opd_teacher: bool = False) -> None:
         self.args = args
         self.role = role
         self.with_ref = with_ref
@@ -129,36 +147,46 @@ class TrainRayActor(NodeProbeMixin):
         self._heartbeat.bump()
 
     @ray.method(concurrency_group="heartbeat_status")
+    @rpc(concurrency_group="heartbeat_status")
     def get_heartbeat_status(self) -> HeartbeatStatus:
         return self._heartbeat.status()
 
     @ray.method(concurrency_group="fault_injector")
+    @rpc(concurrency_group="fault_injector")
     def inject_fault(self, mode: str) -> None:
         _inject_fault(mode=mode)
 
     @ray.method(concurrency_group="kill_self")
+    @rpc(concurrency_group="kill_self")
     def kill_self(self) -> None:
         os._exit(1)
 
-    def clear_memory(self):
+    def clear_memory(self) -> None:
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
-    def sleep(self, tags):
+    def sleep(self) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
-    def wake_up(self, tags):
+    def wake_up(self) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
-    def train(self, rollout_id, rollout_data_ref, external_data=None):
+    def train(
+        self,
+        rollout_id: int,
+        rollout_data_ref: StoreObjectRef | list[StoreObjectRef],
+        witness_info: WitnessInfo | None = None,
+        attempt: int = 0,
+        external_data: TrainStepOutput | None = None,
+    ) -> TrainStepOutput:
         raise NotImplementedError
 
     @abc.abstractmethod
-    def save_model(self, rollout_id, force_sync=False):
+    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         raise NotImplementedError
 
     def export_hf(self, rollout_id: int, path: str) -> None:
@@ -166,12 +194,12 @@ class TrainRayActor(NodeProbeMixin):
         raise NotImplementedError(f"{type(self).__name__} does not support HF export")
 
     @abc.abstractmethod
-    def update_weights(self, info: "UpdatableEngines") -> int | None:
+    def update_weights(self, info: UpdatableEngines) -> int | None:
         raise NotImplementedError
 
     @abc.abstractmethod
     def _get_parallel_config(self):
         raise NotImplementedError
 
-    def get_train_parallel_config(self) -> dict:
+    def get_train_parallel_config(self) -> dict[str, Any]:
         return self.train_parallel_config

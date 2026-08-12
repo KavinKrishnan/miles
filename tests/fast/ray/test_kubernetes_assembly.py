@@ -12,6 +12,7 @@ from tests.fast.utils.workers.worker_provider.kubernetes.core.test_pod_view impo
 
 from miles.ray import placement_group
 from miles.ray.placement_group import create_rollout_components
+from miles.ray.rollout.eval_fleet import EvalFleetInfo
 from miles.ray.specs import inference as specs_inference
 from miles.ray.specs import rollout as specs_rollout
 from miles.ray.specs import train as specs_train
@@ -30,7 +31,7 @@ from miles.utils.workers.worker_provider.kubernetes.core.provider import Kuberne
 from miles.utils.workers.worker_provider.kubernetes.helm import env, naming
 from miles.utils.workers.worker_provider.kubernetes.helm.builder import compute_helm_backend_capability
 from miles.utils.workers.worker_provider.kubernetes.helm.env import NAMESPACE_ENV_VAR, RELEASE_ENV_VAR
-from miles.utils.workers.worker_spec import PortInfo, SchedulingSpec, ServeWorkerSpec
+from miles.utils.workers.worker_spec import HostAndPort, PortInfo, SchedulingSpec, ServeWorkerSpec
 
 NAMESPACE = "rl"
 _RELEASE = "miles-run-260805"
@@ -60,6 +61,7 @@ class FakeRolloutExecutor:
         self.initialized = False
         self.loaded: list[int | None] = []
         self.train_parallel_config: dict[str, Any] | None = None
+        self.eval_fleet: EvalFleetInfo | None = None
 
     async def init(self) -> None:
         self.initialized = True
@@ -85,11 +87,15 @@ class FakeRolloutExecutor:
     def set_train_parallel_config(self, config: dict[str, Any]) -> None:
         self.train_parallel_config = config
 
+    async def set_eval_fleet(self, eval_fleet: EvalFleetInfo | None) -> None:
+        self.eval_fleet = eval_fleet
+
 
 class FakeInferenceController:
-    def __init__(self) -> None:
+    def __init__(self, eval_fleet: EvalFleetInfo | None = None) -> None:
         self.initialized = False
         self.prepared: list[int] = []
+        self._eval_fleet = eval_fleet
 
     async def init(self) -> None:
         self.initialized = True
@@ -111,6 +117,9 @@ class FakeInferenceController:
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {}
+
+    async def get_eval_fleet(self) -> EvalFleetInfo | None:
+        return self._eval_fleet
 
 
 class FakeTrainerController:
@@ -415,7 +424,8 @@ class TestKubernetesDriverAssembly:
         """create_rollout_components is the driver's door into rollout, so it too must open over rpc."""
         capability = install(monkeypatch, pods=cell_pods(2))
 
-        controller = FakeInferenceController()
+        eval_fleet = EvalFleetInfo(router=HostAndPort(host="10.0.0.9", port=31000), num_gpus=2, num_gpus_per_engine=1)
+        controller = FakeInferenceController(eval_fleet)
         executor = FakeRolloutExecutor()
         executor_host = STATIC_HOSTS[specs_rollout.ROLLOUT_EXECUTOR_POOL_ID]
         controller_host = STATIC_HOSTS[specs_inference.INFERENCE_CONTROLLER_POOL_ID]
@@ -448,6 +458,8 @@ class TestKubernetesDriverAssembly:
         assert executor.initialized
         assert result.num_rollout_per_epoch == 7
         assert args.num_rollout == 21
+        # The fleet is only knowable through a call, and it must arrive at the executor intact.
+        assert executor.eval_fleet == eval_fleet
 
     def test_the_trainer_controller_answers_over_rpc_with_no_actor_behind_it(self, monkeypatch: pytest.MonkeyPatch):
         """Under Kubernetes the trainer controller is a pod the driver addresses, not an object it builds."""

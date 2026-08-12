@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from miles.utils.retry_utils import NonRetryableError
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.rpc.common.metadata import RpcMethodSpec
 from miles.utils.workers.rpc.common.protocol import CallStatusResponse
@@ -53,7 +54,11 @@ class RpcCallExecutor:
             raise
         except Exception as e:
             log_structured(logger.error, phase="end", ok=False, **log_fields, exc_info=True)
-            outcome = CallStatusResponse(status="failed", error="".join(traceback.format_exception(e)))
+            outcome = CallStatusResponse(
+                status="failed",
+                error="".join(traceback.format_exception(e)),
+                non_retryable=isinstance(e, NonRetryableError),
+            )
 
         finish(outcome=outcome)
 

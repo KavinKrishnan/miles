@@ -4,8 +4,17 @@ from functools import partial
 
 import ray.actor
 
+from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_info import WorkerInfo
-from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, ReconcileFn, StopWatchFn
+from miles.utils.workers.worker_provider.base import (
+    BaseWorkerProvider,
+    CellInfo,
+    ReconcileFn,
+    StopWatchFn,
+    cell_id_of_worker,
+    select_handle,
+)
+from miles.utils.workers.worker_provider.utils import attach_rpc_handle
 from miles.utils.workers.worker_spec import NamedHostAndPorts
 
 logger = logging.getLogger(__name__)
@@ -24,10 +33,21 @@ class RayWorkerProvider(BaseWorkerProvider):
         self._worker_manager_handle = worker_manager_handle
         self._pool_ids = pool_ids
         self._poll_interval_seconds = poll_interval_seconds
+        self._handles: dict[str, tuple[int, BaseWorkerHandle]] = {}
 
     def get_worker_infos(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]:
         refs = [self._worker_manager_handle.get_worker_infos.remote(cell_id) for cell_id in cell_ids]
-        return ray.get(refs)
+        return self._attach_handles(ray.get(refs))
+
+    async def _get_worker_infos_async(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]:
+        infos_per_cell = await asyncio.gather(
+            *[self._worker_manager_handle.get_worker_infos.remote(cell_id) for cell_id in cell_ids]
+        )
+        return self._attach_handles(infos_per_cell)
+
+    async def get_handle_async(self, worker_name: str) -> BaseWorkerHandle:
+        (infos,) = await self._get_worker_infos_async(cell_ids=[cell_id_of_worker(worker_name)])
+        return select_handle(worker_name=worker_name, infos=infos)
 
     async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
         return await self._worker_manager_handle.get_worker_addrs.remote(worker_name)
@@ -39,6 +59,18 @@ class RayWorkerProvider(BaseWorkerProvider):
         await self._poll_once(reconcile, seen_infos=seen_infos, pool_ids=pool_ids)
         task = asyncio.create_task(self._watch_loop(reconcile, seen_infos, pool_ids=pool_ids))
         return partial(_cancel_and_await_task, task)
+
+    def _attach_handles(self, infos_per_cell: list[list[WorkerInfo]]) -> list[list[WorkerInfo]]:
+        return [[self._attach_cached_handle(info) for info in infos] for infos in infos_per_cell]
+
+    def _attach_cached_handle(self, info: WorkerInfo) -> WorkerInfo:
+        if info.handle is not None or info.worker_class is None:
+            return info
+        cached = self._handles.get(info.name)
+        if cached is None or cached[0] != info.generation:
+            cached = (info.generation, attach_rpc_handle(info).handle)
+            self._handles[info.name] = cached
+        return info.model_copy(update=dict(handle=cached[1]))
 
     def _watched_pool_ids(self) -> list[str]:
         assert self._pool_ids is not None, "this provider was built without the pool_ids it is meant to observe"

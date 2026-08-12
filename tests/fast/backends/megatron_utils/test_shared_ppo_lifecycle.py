@@ -81,7 +81,7 @@ def _worker(actor_module, role, *, asleep=True):
 def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypatch):
     worker = _worker(actor_module, "critic")
     critic_output = TrainStepOutput(outcome=TrainStepOutcome.NORMAL, values=Box("cpu-values-ref"))
-    worker.train_critic = Mock(return_value=critic_output)
+    worker._train_critic = Mock(return_value=critic_output)
     monkeypatch.setattr(
         actor_module, "get_rollout_data", lambda _args, _ref, **_kwargs: ({"tokens": []}, nullcontext())
     )
@@ -97,7 +97,7 @@ def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypat
     result = worker.train(3, object())
 
     worker.wake_up.assert_called_once_with()
-    worker.train_critic.assert_called_once()
+    worker._train_critic.assert_called_once()
     worker.sleep.assert_not_called()
     assert result is critic_output
     assert result.outcome is TrainStepOutcome.NORMAL
@@ -107,7 +107,7 @@ def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypat
 
 def test_actor_receives_critic_payload_and_leaves_offload_to_driver(actor_module, monkeypatch):
     worker = _worker(actor_module, "actor")
-    worker.train_actor = Mock(return_value=None)
+    worker._train_actor = Mock(return_value=None)
     monkeypatch.setattr(
         actor_module, "get_rollout_data", lambda _args, _ref, **_kwargs: ({"tokens": []}, nullcontext())
     )
@@ -116,15 +116,15 @@ def test_actor_receives_critic_payload_and_leaves_offload_to_driver(actor_module
     result = worker.train(4, object(), external_data=values)
 
     worker.wake_up.assert_called_once_with()
-    worker.train_actor.assert_called_once()
-    assert worker.train_actor.call_args.kwargs["external_data"] is values
+    worker._train_actor.assert_called_once()
+    assert worker._train_actor.call_args.kwargs["external_data"] is values
     worker.sleep.assert_not_called()
     assert result is None
 
 
 def test_train_keeps_model_resident(actor_module, monkeypatch):
     worker = _worker(actor_module, "actor", asleep=False)
-    worker.train_actor = Mock(return_value=None)
+    worker._train_actor = Mock(return_value=None)
     monkeypatch.setattr(
         actor_module, "get_rollout_data", lambda _args, _ref, **_kwargs: ({"tokens": []}, nullcontext())
     )
@@ -334,14 +334,14 @@ def test_critic_output_roundtrips_into_actor_external_data(actor_module: Any, mo
     monkeypatch.setattr(actor_module.torch.cuda, "current_device", lambda: torch.device("cpu"))
     critic_values = [torch.tensor([1.0, 2.0]), torch.tensor([3.0])]
 
-    critic_output = _critic_worker(actor_module).train_critic(rollout_id=7, rollout_data={"values": critic_values})
+    critic_output = _critic_worker(actor_module)._train_critic(rollout_id=7, rollout_data={"values": critic_values})
 
     assert isinstance(critic_output, TrainStepOutput)
     assert critic_output.outcome is TrainStepOutcome.NORMAL
     assert critic_output.values is not None
 
     actor_rollout_data: dict[str, Any] = {"tokens": []}
-    actor_output = _actor_worker(actor_module).train_actor(
+    actor_output = _actor_worker(actor_module)._train_actor(
         8, actor_rollout_data, critic_output, witness_info=None, attempt=0
     )
 

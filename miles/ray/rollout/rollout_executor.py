@@ -6,7 +6,7 @@ from typing import Any
 
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
-from miles.ray.rollout.eval_fleet import EvalFleet
+from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetSession
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
@@ -15,6 +15,7 @@ from miles.ray.rollout.train_data_conversion import (
     convert_samples_to_train_data,
     split_train_data_by_dp,
 )
+from miles.ray.specs.inference import inference_controller_worker_name
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -34,6 +35,7 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
 from miles.utils.misc import NodeProbeMixin
+from miles.utils.multi_lora import EmptyBatchTimeoutError
 from miles.utils.timer import timer
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane
@@ -55,6 +57,7 @@ class RolloutExecutor(NodeProbeMixin):
         args,
         router_providers: Sequence[BaseWorkerProvider],
         session_server_provider: BaseWorkerProvider | None,
+        inference_controller_provider: BaseWorkerProvider,
     ):
         event_logger_checkpoint.restore(args)
         configure_logger(args, source=SimpleProcessIdentity(component="rollout_executor"))
@@ -64,6 +67,7 @@ class RolloutExecutor(NodeProbeMixin):
         self.weight_version: int | None = None
         self._router_providers = router_providers
         self._session_server_provider = session_server_provider
+        self._inference_controller_provider = inference_controller_provider
 
     async def init(self) -> None:
         args = self.args
@@ -105,7 +109,7 @@ class RolloutExecutor(NodeProbeMixin):
 
         self.rollout_id = -1
         self._eval_lock = asyncio.Lock()
-        self._eval_fleet: EvalFleet | None = None
+        self._eval_fleet: EvalFleetSession | None = None
 
         self._metric_checker = MetricChecker.maybe_create(args)
 
@@ -128,7 +132,11 @@ class RolloutExecutor(NodeProbeMixin):
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
-            data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
+            try:
+                data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
+            except EmptyBatchTimeoutError as e:
+                logger.warning(f"Rollout {rollout_id} produced no trainable group before the empty-wait timeout: {e}")
+                return dict(sample_indices=None, data_ref=None, empty_batch_timeout=True)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = convert_samples_to_train_data(
@@ -143,7 +151,7 @@ class RolloutExecutor(NodeProbeMixin):
             data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
         else:
             data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config)
-        return dict(sample_indices=sample_indices, data_ref=data_ref)
+        return dict(sample_indices=sample_indices, data_ref=data_ref, empty_batch_timeout=False)
 
     async def eval(
         self,
@@ -278,5 +286,12 @@ class RolloutExecutor(NodeProbeMixin):
     def set_train_parallel_config(self, config: dict[str, Any]) -> None:
         self.train_parallel_config = config
 
-    def set_eval_fleet(self, eval_fleet: "EvalFleet | None"):
-        self._eval_fleet = eval_fleet
+    async def set_eval_fleet(self, eval_fleet: EvalFleetInfo | None) -> None:
+        if eval_fleet is None:
+            self._eval_fleet = None
+            return
+
+        inference_controller = await self._inference_controller_provider.get_handle_async(
+            inference_controller_worker_name()
+        )
+        self._eval_fleet = EvalFleetSession(self.args, info=eval_fleet, inference_controller=inference_controller)

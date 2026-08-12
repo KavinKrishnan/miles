@@ -15,6 +15,7 @@ from miles.utils.workers.rpc.client.misc import (
     RETRY_INITIAL_DELAY_SECONDS,
     RETRY_MAX_DELAY_SECONDS,
     RETRYABLE_ERRORS,
+    NonRetryableRpcWorkerCallError,
     RetryableResponseError,
     RpcTransport,
     RpcWorkerCallError,
@@ -70,7 +71,8 @@ class RpcCall:
         ok = outcome.status != "failed"
         log_structured(logger.debug, op="call", phase="end", ok=ok, **self._log_fields, elapsed_s=round(elapsed, 3))
         if not ok:
-            raise RpcWorkerCallError(f"{self._method_label} failed remotely:\n{outcome.error}")
+            error_cls = NonRetryableRpcWorkerCallError if outcome.non_retryable else RpcWorkerCallError
+            raise error_cls(f"{self._method_label} failed remotely:\n{outcome.error}")
         return self._spec.serializer.decode_result(outcome.result)
 
     async def _submit(self) -> None:

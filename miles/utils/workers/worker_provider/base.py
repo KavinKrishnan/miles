@@ -41,11 +41,21 @@ class BaseWorkerProvider(abc.ABC):
         return None
 
     def get_handle(self, worker_name: str) -> BaseWorkerHandle:
-        pool_id, cell_index, _worker_in_cell_index = parse_worker_name(worker_name)
-        cell_id = compute_cell_id(pool_id=pool_id, cell_index=cell_index)
-        (infos,) = self.get_worker_infos(cell_ids=[cell_id])
-        matches = [info for info in infos if info.name == worker_name]
-        assert len(matches) == 1, f"{worker_name=} matched {[info.name for info in matches]}"
-        handle = matches[0].handle
-        assert handle is not None, f"pool {pool_id} has no worker class, so its rpc methods are unknown"
-        return handle
+        (infos,) = self.get_worker_infos(cell_ids=[cell_id_of_worker(worker_name)])
+        return select_handle(worker_name=worker_name, infos=infos)
+
+    async def get_handle_async(self, worker_name: str) -> BaseWorkerHandle:
+        return self.get_handle(worker_name)
+
+
+def cell_id_of_worker(worker_name: str) -> str:
+    pool_id, cell_index, _worker_in_cell_index = parse_worker_name(worker_name)
+    return compute_cell_id(pool_id=pool_id, cell_index=cell_index)
+
+
+def select_handle(*, worker_name: str, infos: list[WorkerInfo]) -> BaseWorkerHandle:
+    matches = [info for info in infos if info.name == worker_name]
+    assert len(matches) == 1, f"{worker_name=} matched {[info.name for info in matches]}"
+    handle = matches[0].handle
+    assert handle is not None, f"{worker_name} has no worker class, so its rpc methods are unknown"
+    return handle
