@@ -58,7 +58,7 @@ def start_api_server(
     _start_api_server_raw(registry=_CellRegistry(handlers), port=port)
 
 
-def _start_api_server_raw(registry: _CellRegistry, port: int) -> None:
+def _start_api_server_raw(registry: _CellRegistry, port: int) -> uvicorn.Server:
     app = _create_api_app(registry)
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port))
@@ -85,6 +85,7 @@ def _start_api_server_raw(registry: _CellRegistry, port: int) -> None:
         time.sleep(_API_SERVER_STARTUP_POLL_INTERVAL_SECONDS)
 
     logger.info("Api server started on port %d", port)
+    return server
 
 
 # -------------------------- main app ------------------------------
