@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -378,3 +379,60 @@ class TestStartApiServerRaw:
 
             with pytest.raises(RuntimeError, match=f"port {port} failed during startup"):
                 server._start_api_server_raw(registry=_CellRegistry([]), port=port)
+
+
+class TestStartAndWaitThread:
+    def test_it_returns_once_the_thread_reports_ready(self):
+        """The caller may only proceed after the thing it started is actually usable."""
+        ready = threading.Event()
+
+        thread = server._start_and_wait_thread(
+            target=ready.set, is_ready=ready.is_set, description="probe", timeout_seconds=5.0
+        )
+
+        assert ready.is_set()
+        assert isinstance(thread, threading.Thread)
+
+    def test_a_failure_on_the_thread_reaches_the_caller(self):
+        """A daemon thread that dies alone is invisible, which is how a lost port went unnoticed."""
+
+        def _boom() -> None:
+            raise ValueError("could not start")
+
+        with pytest.raises(RuntimeError, match="probe failed during startup") as excinfo:
+            server._start_and_wait_thread(
+                target=_boom, is_ready=lambda: False, description="probe", timeout_seconds=5.0
+            )
+
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_a_thread_that_exits_without_becoming_ready_fails_the_caller(self):
+        """Returning quietly is its own failure: nothing is serving afterwards."""
+        with pytest.raises(RuntimeError, match="probe exited during startup"):
+            server._start_and_wait_thread(
+                target=lambda: None, is_ready=lambda: False, description="probe", timeout_seconds=5.0
+            )
+
+    def test_a_thread_that_never_becomes_ready_times_out(self):
+        """A wedged startup must not block the caller forever."""
+        stop = threading.Event()
+
+        try:
+            with pytest.raises(TimeoutError, match="probe did not finish startup"):
+                server._start_and_wait_thread(
+                    target=stop.wait, is_ready=lambda: False, description="probe", timeout_seconds=0.2
+                )
+        finally:
+            stop.set()
+
+    def test_a_ready_thread_is_not_judged_by_a_later_failure(self):
+        """Readiness wins the race: a server that starts and later dies is the caller's problem, not startup's."""
+        ready = threading.Event()
+
+        def _ready_then_raise() -> None:
+            ready.set()
+            raise ValueError("died after serving")
+
+        server._start_and_wait_thread(
+            target=_ready_then_raise, is_ready=ready.is_set, description="probe", timeout_seconds=5.0
+        )

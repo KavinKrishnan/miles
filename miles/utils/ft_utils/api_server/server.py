@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections.abc import Callable
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -12,12 +15,12 @@ from miles.ray.train.group import TrainerController
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.models import Cell, CellList, CellPatch, FaultInjection, K8sStatus, _OkResponse
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
-from miles.utils.thread_utils import start_and_wait_thread
 from miles.utils.workers.ray_worker_manager import RayWorkerManager
 
 logger = logging.getLogger(__name__)
 
 _API_SERVER_STARTUP_TIMEOUT_SECONDS = 30.0
+_THREAD_READY_POLL_INTERVAL_SECONDS = 0.05
 
 
 # -------------------------- entrypoint ------------------------------
@@ -60,7 +63,7 @@ def _start_api_server_raw(registry: _CellRegistry, port: int) -> uvicorn.Server:
     app = _create_api_app(registry)
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port))
-    start_and_wait_thread(
+    _start_and_wait_thread(
         target=server.run,
         is_ready=lambda: server.started,
         description=f"Api server on port {port}",
@@ -156,3 +159,39 @@ class _K8sError(Exception):
         self.status_code = status_code
         self.reason = reason
         self.message = message
+
+
+# -------------------------- thread startup ------------------------------
+
+
+def _start_and_wait_thread(
+    *,
+    target: Callable[[], None],
+    is_ready: Callable[[], bool],
+    description: str,
+    timeout_seconds: float,
+) -> threading.Thread:
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            target()
+        except BaseException as err:  # noqa: BLE001 - re-raised on the caller thread below
+            logger.error("%s died", description, exc_info=True)
+            error.append(err)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + timeout_seconds
+    while not is_ready():
+        if error:
+            raise RuntimeError(f"{description} failed during startup") from error[0]
+        if not thread.is_alive():
+            raise RuntimeError(f"{description} exited during startup")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{description} did not finish startup within {timeout_seconds}s")
+        time.sleep(_THREAD_READY_POLL_INTERVAL_SECONDS)
+
+    logger.info("%s started", description)
+    return thread
