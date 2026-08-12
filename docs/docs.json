@@ -210,6 +210,7 @@
          "advanced/fault-tolerance",
          "advanced/pd-disaggregation",
          "advanced/p2p-weight-transfer",
+         "advanced/modelexpress-weight-transfer",
          "advanced/disk-offload"
         ],
         "expanded": false
