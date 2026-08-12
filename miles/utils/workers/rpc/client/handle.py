@@ -21,15 +21,20 @@ from miles.utils.workers.rpc.common.metadata import (
     canonicalize_method_arguments,
     collect_rpc_method_specs,
 )
-from miles.utils.workers.rpc.common.protocol import HEALTH_PATH, HealthResponse
+from miles.utils.workers.rpc.common.protocol import HEALTH_PATH, IN_FLIGHT_PATH, HealthResponse, InFlightResponse
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
 
 DEFAULT_CALL_TIMEOUT_SECONDS = 3600.0
 DEFAULT_READY_TIMEOUT_SECONDS = 600.0
+DEFAULT_IDLE_TIMEOUT_SECONDS = 3600.0
 
 _HEALTH_TIMEOUT_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
+
+
+class _StillBusyError(Exception):
+    pass
 
 
 class RpcWorkerHandle(BaseWorkerHandle):
@@ -75,6 +80,7 @@ class RpcWorkerHandle(BaseWorkerHandle):
 
     async def wait_ready(self, *, timeout: float) -> None:
         async def attempt(remaining: float) -> None:
+            self._boot_uuid_pin.rebaseline()
             await self._transport.request(
                 "GET", HEALTH_PATH, seconds=min(_HEALTH_TIMEOUT_SECONDS, remaining), response_model=HealthResponse
             )
@@ -91,6 +97,28 @@ class RpcWorkerHandle(BaseWorkerHandle):
             raise WorkerUnreachableError(
                 f"{self._worker_cls_name} rpc server not ready within {timeout}s: {e!r}"
             ) from e
+
+    async def get_in_flight_call_ids(self) -> list[str]:
+        response = await self._transport.request(
+            "GET", IN_FLIGHT_PATH, seconds=_HEALTH_TIMEOUT_SECONDS, response_model=InFlightResponse
+        )
+        return response.call_ids
+
+    async def wait_idle(self, *, timeout: float = DEFAULT_IDLE_TIMEOUT_SECONDS) -> None:
+        async def attempt(_remaining: float) -> None:
+            if call_ids := await self.get_in_flight_call_ids():
+                raise _StillBusyError(f"{self._worker_cls_name} is still running {call_ids}")
+
+        try:
+            await retry_until_deadline(
+                attempt,
+                total_seconds=timeout,
+                retry_on=(_StillBusyError, *RETRYABLE_ERRORS),
+                initial_delay=RETRY_INITIAL_DELAY_SECONDS,
+                backoff_factor=1.0,
+            )
+        except (_StillBusyError, *RETRYABLE_ERRORS) as e:
+            raise TimeoutError(f"{self._worker_cls_name} was still busy after {timeout}s: {e!r}") from e
 
     async def _probe_is_dead(self) -> bool:
         try:

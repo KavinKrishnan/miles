@@ -107,9 +107,9 @@ deployment installed a moment earlier is not a race.
   of its own ranks, which its own controller drives.
 - Failure does not cross a release. An orchestration script that loses a controller fails loud in its
   own release and tears down nothing else, so the trainer and the inference side survive it — which is
-  also what a later hot restart will need. A failed weight update is aborted on the inference controller
-  before the failure is re-raised, so the surviving release keeps neither the update window's lock nor
-  its paused health checking.
+  also what [hot restart](/advanced/hot-restart) needs. A failed weight update is aborted on the inference
+  controller before the failure is re-raised, so the surviving release keeps neither the update window's
+  lock nor its paused health checking.
 - A CI launch cleans up the leftover CI releases of *other* runs before installing its own; the sibling
   releases of the run it is launching are never touched.
 - Relaunching a run id only resizes pools, per release, exactly as it does for an unsplit run.
@@ -129,7 +129,7 @@ today.
 - **Not, on its own, several trainers or several engine pools.** A split names one instance of each.
   Installing one release per policy trainer, and registering engine-only deployments into the run's
   one inference controller, is [multi instance deployment](/advanced/multi-instance-deployment).
-- **Not a hot restart.** A new orchestration script does not reattach to a running trainer; the
-  surviving releases are only the precondition for that.
+- **Not, on its own, a hot restart.** The surviving releases are only the precondition;
+  [hot restart](/advanced/hot-restart) is what reattaches a new orchestration script to them.
 - **Not external rollout.** [External rollout](/advanced/external-rollout) hands Miles engines it does
   not manage. Here Miles manages every worker, in deployments of its own.

@@ -235,6 +235,7 @@
          "advanced/cluster-backend",
          "advanced/split-deployment",
          "advanced/multi-instance-deployment",
+         "advanced/hot-restart",
          "advanced/multi-policy"
         ],
         "expanded": false

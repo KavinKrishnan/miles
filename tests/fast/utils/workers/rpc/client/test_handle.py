@@ -701,16 +701,75 @@ class TestBootUuid:
                 await handle.wait_ready(timeout=5.0)
                 assert transport.requests > 1
 
-    async def test_wait_ready_keeps_original_pin_after_restart(self) -> None:
-        """wait_ready refuses a new boot after the first pin."""
+    async def test_wait_ready_rebaselines_onto_the_boot_it_finds(self) -> None:
+        """A restart is expected exactly while waiting for readiness, so wait_ready re-pins there."""
         async with _running_app(_Worker()) as first_app, _running_app(_Worker()) as second_app:
             transport = _HookTransport(first_app)
             async with _handle_over(transport, require_stable_boot_uuid=True) as handle:
                 assert await handle.demo_default_arg(a=1, b=2) == 3
 
                 transport.switch_to(second_app)
+                await handle.wait_ready(timeout=5.0)
+
+                assert await handle.demo_default_arg(a=1, b=2) == 3
+
+    async def test_a_restart_after_wait_ready_is_still_refused(self) -> None:
+        """Re-baselining widens the tolerated window to wait_ready, it does not turn strict mode off."""
+        async with _running_app(_Worker()) as first_app, _running_app(_Worker()) as second_app:
+            transport = _HookTransport(first_app)
+            async with _handle_over(transport, require_stable_boot_uuid=True) as handle:
+                await handle.wait_ready(timeout=5.0)
+                assert await handle.demo_default_arg(a=1, b=2) == 3
+
+                transport.switch_to(second_app)
                 with pytest.raises(ServerRestartedError):
-                    await handle.wait_ready(timeout=5.0)
+                    await handle.demo_default_arg(a=1, b=2)
+
+
+class TestWaitIdle:
+    async def test_an_idle_worker_returns_at_once(self) -> None:
+        """A restarted script must not stall on a worker that is doing nothing."""
+        async with _running_app(_Worker()) as app, _handle_over(httpx.ASGITransport(app=app)) as handle:
+            await handle.wait_idle(timeout=5.0)
+
+    async def test_in_flight_call_ids_are_reported(self) -> None:
+        """The wait logs what it waits for, so the ids have to reach the client."""
+        worker = _Worker()
+        async with _running_app(worker) as app, _handle_over(httpx.ASGITransport(app=app)) as handle:
+            pending = asyncio.create_task(handle.demo_hang())
+            await asyncio.sleep(0.3)
+
+            assert len(await handle.get_in_flight_call_ids()) == 1
+
+            worker.block_forever.set()
+            await pending
+
+    async def test_it_returns_once_the_running_call_finishes(self, fast_retries: None) -> None:
+        """This is the 'wait for the train step the previous script started' step of a hot restart."""
+        worker = _Worker()
+        async with _running_app(worker) as app, _handle_over(httpx.ASGITransport(app=app)) as handle:
+            pending = asyncio.create_task(handle.demo_hang())
+            await asyncio.sleep(0.3)
+            waiting = asyncio.create_task(handle.wait_idle(timeout=10.0))
+            await asyncio.sleep(0.3)
+            assert not waiting.done()
+
+            worker.block_forever.set()
+            await pending
+            await waiting
+
+    async def test_a_worker_that_never_finishes_times_out(self, fast_retries: None) -> None:
+        """A wedged trainer must fail the restart loudly rather than hang the new script forever."""
+        worker = _Worker()
+        async with _running_app(worker) as app, _handle_over(httpx.ASGITransport(app=app)) as handle:
+            pending = asyncio.create_task(handle.demo_hang())
+            await asyncio.sleep(0.3)
+
+            with pytest.raises(TimeoutError, match="still busy"):
+                await handle.wait_idle(timeout=0.5)
+
+            worker.block_forever.set()
+            await pending
 
 
 class TestWaitReady:

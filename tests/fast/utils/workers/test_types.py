@@ -1,6 +1,6 @@
 import pytest
 
-from miles.utils.workers.types import DeployComponent, DeploySelector
+from miles.utils.workers.types import DeployComponent, DeploySelector, HotRestartComponent, parse_hot_restart
 
 
 class TestDeploySelectorParse:
@@ -118,3 +118,28 @@ class TestDeployComponentTakesInstance:
     def test_the_components_a_run_deploys_exactly_one_of(self, component: DeployComponent) -> None:
         """Naming an instance of them would be a second copy of the run itself."""
         assert not component.takes_instance()
+
+
+class TestParseHotRestart:
+    def test_an_empty_value_asks_for_no_restart(self):
+        """Every ordinary launch goes through this parser, so the empty default has to mean nothing happens."""
+        assert parse_hot_restart("") == frozenset()
+
+    def test_both_supported_components_parse(self):
+        """This is the value the feature is documented with."""
+        assert parse_hot_restart("orchestration,rollout_executor") == frozenset(HotRestartComponent)
+
+    def test_whitespace_and_empty_entries_are_tolerated(self):
+        """Users copy the value out of docs and shells, so a stray space must not be an error."""
+        assert parse_hot_restart(" orchestration , rollout_executor ,") == frozenset(HotRestartComponent)
+
+    @pytest.mark.parametrize("value", ["orchestration", "rollout_executor"])
+    def test_one_component_on_its_own_is_refused(self, value: str):
+        """A new script cannot drive the executor its predecessor initialized, and the reverse kills a live run."""
+        with pytest.raises(AssertionError, match="replaced together or not at all"):
+            parse_hot_restart(value)
+
+    def test_an_unsupported_component_is_refused_by_name(self):
+        """Silently ignoring `trainer` would promise a restart that never happens."""
+        with pytest.raises(AssertionError, match="'trainer'"):
+            parse_hot_restart("orchestration,trainer")

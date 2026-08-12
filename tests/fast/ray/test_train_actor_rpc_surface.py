@@ -10,7 +10,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOu
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.object_store import StoreObjectRef
-from miles.utils.workers.rpc.common.metadata import collect_rpc_method_specs
+from miles.utils.workers.rpc.common.metadata import DEFAULT_CONCURRENCY_GROUP, collect_rpc_method_specs
 
 DRIVEN_METHODS = (
     "init",
@@ -27,6 +27,8 @@ DRIVEN_METHODS = (
     "kill_self",
     "configure_master_addr_and_port",
     "propose_master_addr_and_port",
+    "is_initialized",
+    "load_state",
 )
 
 
@@ -171,3 +173,24 @@ class TestTheConcreteBackends:
         actor_module = pytest.importorskip("miles.backends.fsdp_utils.actor")
 
         assert set(DRIVEN_METHODS) <= set(collect_rpc_method_specs(actor_module.FSDPTrainRayActor))
+
+
+class TestTheResumeSurface:
+    def test_the_reload_runs_on_the_serialized_queue_a_train_step_runs_on(self):
+        """Reloading a checkpoint while a step is running would write two things into one model."""
+        specs = collect_rpc_method_specs(TrainRayActor)
+
+        assert specs["load_state"].concurrency_group == DEFAULT_CONCURRENCY_GROUP
+        assert specs["train"].concurrency_group == DEFAULT_CONCURRENCY_GROUP
+
+    def test_the_reload_is_not_answered_off_the_heartbeat_queue(self):
+        """The heartbeat queue exists to answer while the gpu is busy, which is the opposite of a reload."""
+        specs = collect_rpc_method_specs(TrainRayActor)
+
+        assert specs["load_state"].concurrency_group != specs["get_heartbeat_status"].concurrency_group
+
+    def test_the_reload_answers_the_rollout_id_to_resume_at(self):
+        """A restarted orchestration script has no other source for it, since it never called init."""
+        spec = collect_rpc_method_specs(TrainRayActor)["load_state"]
+
+        assert spec.serializer.decode_result(spec.serializer.encode_result(7)) == 7

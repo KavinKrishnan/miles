@@ -326,3 +326,35 @@ class TestDefaultTtls:
         now[0] = 10.0 + FINISHED_TTL_SECONDS + 0.01
         store.begin(call_id="another")
         assert not store.contains("c1")
+
+
+class TestInFlightCallIds:
+    async def test_a_quiet_store_reports_nothing_in_flight(self) -> None:
+        """An idle server is exactly what a restarted orchestration script waits for."""
+        assert _make_store().in_flight_call_ids() == []
+
+    async def test_an_accepted_call_is_in_flight_until_it_finishes(self) -> None:
+        """A train step the previous script started must be visible to the one that replaces it."""
+        store = _make_store()
+        store.begin(call_id="c1")
+
+        assert store.in_flight_call_ids() == ["c1"]
+
+        store.finish(call_id="c1", outcome=CallStatusResponse(status="success", result=1))
+        assert store.in_flight_call_ids() == []
+
+    async def test_a_failed_call_is_no_longer_in_flight(self) -> None:
+        """A call that raised is finished; waiting for it forever would wedge the new script."""
+        store = _make_store()
+        store.begin(call_id="c1")
+        store.finish(call_id="c1", outcome=CallStatusResponse(status="failed", error="boom"))
+
+        assert store.in_flight_call_ids() == []
+
+    async def test_several_running_calls_are_all_reported_sorted(self) -> None:
+        """The report names every call, so the wait logs what it is waiting for."""
+        store = _make_store()
+        store.begin(call_id="c2")
+        store.begin(call_id="c1")
+
+        assert store.in_flight_call_ids() == ["c1", "c2"]

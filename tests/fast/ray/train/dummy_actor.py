@@ -48,6 +48,10 @@ class DummyTrainActor:
     def init(self, *args: Any, **kwargs: Any) -> None:
         self._record("init", args, kwargs)
 
+    def load_state(self, *args: Any, **kwargs: Any) -> int:
+        self._record("load_state", args, kwargs)
+        return 11
+
     def configure_master_addr_and_port(self, *args: Any, **kwargs: Any) -> None:
         self._record("configure_master_addr_and_port", args, kwargs)
 

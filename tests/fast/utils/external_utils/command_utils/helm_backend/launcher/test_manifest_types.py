@@ -1,6 +1,11 @@
+import logging
+
 import yaml
 
-from miles.utils.external_utils.command_utils.helm_backend.launcher.manifest_types import Manifest
+from miles.utils.external_utils.command_utils.helm_backend.launcher.manifest_types import (
+    RESTART_AT_ANNOTATION,
+    Manifest,
+)
 
 ORCHESTRATOR = "myrun-miles-run-orchestrator"
 
@@ -137,3 +142,61 @@ class TestKindsItDoesNotModel:
         )
 
         assert manifest.state_file(container="orchestrator") is None
+
+
+_STAMP = "2026-08-12T09:00:00+00:00"
+
+
+def _stamped(name: str, stamp: str | None) -> dict:
+    described = _stateful_set(name=name)
+    if stamp is not None:
+        described["spec"]["template"]["metadata"] = {"annotations": {RESTART_AT_ANNOTATION: stamp}}
+    return described
+
+
+class TestTheRestartStamp:
+    def test_a_run_that_was_never_hot_restarted_carries_none(self):
+        """An ordinary run has no annotation to preserve, and inventing one would roll its pods."""
+        manifest = Manifest.parse(_rendered(_stateful_set()))
+
+        assert manifest.restart_at(preferred_object_name=ORCHESTRATOR) is None
+
+    def test_the_stamp_of_a_hot_restarted_run_is_readable(self):
+        """The next ordinary relaunch renders this value back, so it has to be recoverable from the cluster."""
+        manifest = Manifest.parse(_rendered(_stamped(ORCHESTRATOR, _STAMP)))
+
+        assert manifest.restart_at(preferred_object_name=ORCHESTRATOR) == _STAMP
+
+    def test_the_objects_of_one_hot_restart_share_one_stamp(self):
+        """One hot restart writes one timestamp onto both objects it replaces."""
+        manifest = Manifest.parse(_rendered(_stamped(ORCHESTRATOR, _STAMP), _stamped("executor", _STAMP)))
+
+        assert manifest.restart_at(preferred_object_name=ORCHESTRATOR) == _STAMP
+
+    def test_objects_stamped_differently_keep_the_orchestrators_stamp(self, caplog):
+        """An interrupted upgrade leaves two stamps, and refusing every later launch would strand the run."""
+        manifest = Manifest.parse(
+            _rendered(_stamped(ORCHESTRATOR, _STAMP), _stamped("executor", "2026-01-01T00:00:00+00:00"))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert manifest.restart_at(preferred_object_name=ORCHESTRATOR) == _STAMP
+
+        assert "restart stamps" in caplog.text
+
+    def test_a_stamp_of_another_object_is_carried_when_the_orchestrator_has_none(self):
+        """The orchestrator may be renamed or absent, and a stamp that exists still has to be preserved."""
+        manifest = Manifest.parse(_rendered(_stamped("executor", _STAMP)))
+
+        assert manifest.restart_at(preferred_object_name=ORCHESTRATOR) == _STAMP
+
+    def test_two_kinds_sharing_a_name_are_two_stamps(self, caplog):
+        """Kind and name identify an object, so keying the stamps by name alone would hide a real divergence."""
+        deployment = _stamped("executor", "2026-01-01T00:00:00+00:00")
+        deployment["kind"] = "Deployment"
+        manifest = Manifest.parse(_rendered(_stamped("executor", _STAMP), deployment))
+
+        with caplog.at_level(logging.WARNING):
+            assert manifest.restart_at(preferred_object_name="executor") == _STAMP
+
+        assert "restart stamps" in caplog.text

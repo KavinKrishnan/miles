@@ -372,3 +372,39 @@ class TestBootUuid:
         async with _client(_Worker()) as second_client:
             second = (await second_client.get("/v1/health")).headers[BOOT_UUID_HEADER]
         assert first != second
+
+
+class TestInFlightRoute:
+    async def test_an_idle_server_reports_no_calls(self):
+        """A restarted orchestration script asks this route whether the worker is free."""
+        async with _client(_Worker()) as client:
+            response = await client.get("/v1/in-flight")
+
+            assert response.status_code == 200
+            assert response.json() == {"call_ids": []}
+
+    async def test_a_running_call_is_reported_and_disappears_when_it_ends(self):
+        """Waiting for a mid-flight train step is only possible if the server exposes it."""
+        worker = _Worker()
+        async with _client(worker) as client:
+            submitted = await _submit(client, "demo_slow", {"tag": "t"})
+            assert submitted.response.status_code == 200
+            assert worker.slow_started.wait(timeout=5.0)
+
+            assert (await client.get("/v1/in-flight")).json() == {"call_ids": [submitted.call_id]}
+
+            worker.release_slow.set()
+            await _poll_until_done(client, submitted.call_id)
+            assert (await client.get("/v1/in-flight")).json() == {"call_ids": []}
+
+    async def test_the_route_carries_the_boot_uuid_like_every_other(self):
+        """A client polling for idleness must still notice the process being replaced under it."""
+        async with _client(_Worker()) as client:
+            assert BOOT_UUID_HEADER in (await client.get("/v1/in-flight")).headers
+
+    async def test_the_route_is_refused_when_the_expected_boot_uuid_is_stale(self):
+        """The busy question is about one process, so it must not be answered by its successor."""
+        async with _client(_Worker()) as client:
+            response = await client.get("/v1/in-flight", headers={EXPECTED_BOOT_UUID_HEADER: "someone-else"})
+
+            assert response.status_code == 412

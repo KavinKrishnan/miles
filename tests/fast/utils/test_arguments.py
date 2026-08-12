@@ -10,6 +10,7 @@ import pytest
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as validate_sglang_args
 from miles.utils.arguments import (
+    CHECKPOINT_SOURCE_DEFAULTS,
     _compute_custom_inference_engine_provider_path,
     _compute_rollout_external,
     _maybe_apply_dumper_overrides,
@@ -18,8 +19,10 @@ from miles.utils.arguments import (
     _resolve_mini_ft_controller_enable,
     _resolve_rollout_functions,
     _validate_rematerialize_param_from_master_weight,
+    capture_requested_checkpoint_source,
     get_miles_extra_args_provider,
     miles_validate_args,
+    resolve_checkpoint_source,
     resolve_rollout_function_paths,
     validate_async_off_policy_correction,
     validate_deploy_component,
@@ -1849,3 +1852,137 @@ class TestValidateMultiPolicyArgs:
 
         with pytest.raises(AssertionError, match="different vocabularies"):
             validate_multi_policy_args(args)
+
+
+class TestTheCheckpointSourceDerivation:
+    def _args(self, tmp_path, *, load: str, **overrides):
+        args = argparse.Namespace(
+            megatron_to_hf_mode="raw",
+            load=load,
+            ref_load=str(tmp_path / "ref"),
+            hf_checkpoint=None,
+            ref_ckpt_step=None,
+            ckpt_step=None,
+            finetune=False,
+            no_load_optim=False,
+            no_load_rng=False,
+            start_rollout_id=9,
+            **overrides,
+        )
+        args.requested_checkpoint_source = {name: getattr(args, name) for name in CHECKPOINT_SOURCE_DEFAULTS}
+        return args
+
+    def _write_checkpoint(self, tmp_path):
+        (tmp_path / "save").mkdir(exist_ok=True)
+        (tmp_path / "save" / "latest_checkpointed_iteration.txt").write_text("12")
+
+    def test_a_run_whose_load_dir_is_not_there_yet_starts_from_the_reference_weights(self, tmp_path):
+        """This is every first launch: the checkpoint dir the command names is created by the run itself."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"))
+
+        resolve_checkpoint_source(args)
+
+        assert args.load == args.ref_load
+        assert (args.finetune, args.no_load_optim, args.no_load_rng) == (True, True, True)
+        assert args.start_rollout_id == 0
+
+    def test_the_same_command_derives_a_different_source_once_the_run_has_written_a_checkpoint(self, tmp_path):
+        """The derivation reads the filesystem, so the answer it gave at launch expires as soon as the run saves."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"))
+        resolve_checkpoint_source(args)
+
+        self._write_checkpoint(tmp_path)
+        resolve_checkpoint_source(args)
+
+        assert args.load == str(tmp_path / "save")
+        assert (args.finetune, args.no_load_optim, args.no_load_rng) == (False, False, False)
+
+    def test_a_user_asking_for_finetune_keeps_it_when_the_checkpoint_appears(self, tmp_path):
+        """Only the derived values are re-derived; what the command line asked for is restored as it was."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"), finetune=True)
+        args.requested_checkpoint_source["finetune"] = True
+        resolve_checkpoint_source(args)
+
+        self._write_checkpoint(tmp_path)
+        resolve_checkpoint_source(args)
+
+        assert args.finetune is True
+
+    def test_the_reference_checkpoint_step_is_used_only_while_the_reference_is(self, tmp_path):
+        """--ref-ckpt-step names a step of the reference checkpoint, which means nothing in the run's own one."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"), ref_ckpt_step=3)
+        resolve_checkpoint_source(args)
+        assert args.ckpt_step == 3
+
+        self._write_checkpoint(tmp_path)
+        resolve_checkpoint_source(args)
+
+        assert args.ckpt_step is None
+
+    def test_bridge_mode_falls_back_to_the_reference_only_until_a_checkpoint_exists(self, tmp_path):
+        """The bridge path derives its load dir from the filesystem too, and goes as stale as the other one."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"), megatron_to_hf_mode="bridge")
+        resolve_checkpoint_source(args)
+        assert args.load == args.ref_load
+
+        self._write_checkpoint(tmp_path)
+        resolve_checkpoint_source(args)
+
+        assert args.load == str(tmp_path / "save")
+
+    def test_the_derivation_is_idempotent(self, tmp_path):
+        """Every reload re-runs it against the same filesystem, so a second run must not read its own output."""
+        args = self._args(tmp_path, load=str(tmp_path / "save"), ref_ckpt_step=3)
+
+        resolve_checkpoint_source(args)
+        once = {name: getattr(args, name) for name in CHECKPOINT_SOURCE_DEFAULTS}
+        resolve_checkpoint_source(args)
+
+        assert {name: getattr(args, name) for name in CHECKPOINT_SOURCE_DEFAULTS} == once
+
+
+class TestTheCheckpointSourceCapture:
+    def _args(self, tmp_path, **overrides):
+        return argparse.Namespace(
+            megatron_to_hf_mode="raw",
+            load=str(tmp_path / "save"),
+            ref_load=str(tmp_path / "ref"),
+            hf_checkpoint=None,
+            ref_ckpt_step=None,
+            start_rollout_id=9,
+            **overrides,
+        )
+
+    def test_a_backend_whose_parser_omits_a_field_still_records_it(self, tmp_path):
+        """The fsdp parser defines neither --finetune nor --ckpt-step, and an unrecorded field is never restored."""
+        args = self._args(tmp_path)
+
+        capture_requested_checkpoint_source(args)
+
+        assert args.requested_checkpoint_source == dict(
+            load=str(tmp_path / "save"), ckpt_step=None, finetune=False, no_load_optim=False, no_load_rng=False
+        )
+
+    def test_a_field_the_derivation_created_is_restored_by_the_next_one(self, tmp_path):
+        """This is the hot-restart bug in miniature: a fresh run turns finetune on and nothing ever turns it off."""
+        args = self._args(tmp_path)
+        capture_requested_checkpoint_source(args)
+        resolve_checkpoint_source(args)
+        assert args.finetune is True
+
+        (tmp_path / "save").mkdir(exist_ok=True)
+        (tmp_path / "save" / "latest_checkpointed_iteration.txt").write_text("12")
+        resolve_checkpoint_source(args)
+
+        assert args.finetune is False
+        assert args.load == str(tmp_path / "save")
+
+    def test_what_the_command_line_asked_for_is_recorded_as_it_was(self, tmp_path):
+        """A user who passed --finetune has to keep it, so the capture cannot substitute its own default."""
+        args = self._args(tmp_path, finetune=True, ckpt_step=5, no_load_optim=True, no_load_rng=False)
+
+        capture_requested_checkpoint_source(args)
+
+        assert args.requested_checkpoint_source["finetune"] is True
+        assert args.requested_checkpoint_source["ckpt_step"] == 5
+        assert args.requested_checkpoint_source["no_load_optim"] is True

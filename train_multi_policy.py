@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from miles.ray.deployment import run_deployment
+from miles.ray.hot_restart import init_or_resume_trainer
 from miles.ray.placement_group import create_rollout_components, maybe_start_api_server, update_weights
 from miles.ray.specs.train import create_composite_trainer_controller
 from miles.ray.train.composite import CompositeTrainerController
@@ -243,7 +244,7 @@ async def _create_policies(args, *, config: MegatronConfig, trainers: CompositeT
     ans: list[_Policy] = []
     for model_id in config.model_ids:
         model_args = compute_model_args(args, model_id)
-        start_rollout_ids = await trainers.init(model_args, model_id=model_id)
+        start_rollout_ids = await init_or_resume_trainer(trainers, model_args, model_id=model_id)
         assert len(set(start_rollout_ids)) == 1, f"model {model_id} restored to {start_rollout_ids}"
         ans.append(_Policy(model_id=model_id, start_rollout_id=start_rollout_ids[0]))
     return ans

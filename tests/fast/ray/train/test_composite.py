@@ -12,6 +12,8 @@ class _FakeTrainer:
         self.role = role
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.ready_timeouts: list[float] = []
+        self.idle_timeouts: list[float] = []
+        self.initialized = False
 
     async def wait_ready(self, *, timeout: float) -> None:
         self.ready_timeouts.append(timeout)
@@ -19,6 +21,17 @@ class _FakeTrainer:
     async def init(self, args) -> list[Any]:
         self.calls.append(("init", {"args": args}))
         return [f"{self.role}-init"]
+
+    async def is_initialized(self) -> bool:
+        self.calls.append(("is_initialized", {}))
+        return self.initialized
+
+    async def load_state(self) -> list[Any]:
+        self.calls.append(("load_state", {}))
+        return [f"{self.role}-load_state"]
+
+    async def wait_idle(self, *, timeout: float) -> None:
+        self.idle_timeouts.append(timeout)
 
     async def train(
         self,
@@ -148,3 +161,59 @@ class TestCompositeTrainerController:
         """A composite that fans out over nothing would swallow every call it is given."""
         with pytest.raises(AssertionError, match="at least one trainer"):
             CompositeTrainerController(trainers={})
+
+
+class TestCompositeTrainerControllerResume:
+    async def test_a_fresh_run_reports_that_no_trainer_is_initialized(self):
+        """A cold start must take the init path, not the resume path."""
+        composite, _ = _make_composite("actor", "critic")
+
+        assert await composite.is_initialized() is False
+
+    async def test_trainers_that_all_survived_report_initialized(self):
+        """This is what tells a restarted orchestration script to resume rather than rebuild."""
+        composite, trainers = _make_composite("actor", "critic")
+        for trainer in trainers.values():
+            trainer.initialized = True
+
+        assert await composite.is_initialized() is True
+
+    async def test_trainers_that_disagree_raise_instead_of_guessing(self):
+        """Half a run resumed and half rebuilt would train two different checkpoints under one run id."""
+        composite, trainers = _make_composite("actor", "critic")
+        trainers["actor"].initialized = True
+
+        with pytest.raises(AssertionError, match="disagree on whether they are initialized"):
+            await composite.is_initialized()
+
+    async def test_a_named_model_id_asks_only_that_trainer(self):
+        """Per-policy resume must not be blocked by another policy's state."""
+        composite, trainers = _make_composite("actor", "critic")
+        trainers["critic"].initialized = True
+
+        assert await composite.is_initialized(model_id="critic") is True
+        assert trainers["actor"].calls == []
+
+    async def test_load_state_without_a_model_id_reloads_every_trainer(self):
+        """A restart rolls the whole run back to its checkpoint, not one policy of it."""
+        composite, trainers = _make_composite("actor", "critic")
+
+        assert sorted(await composite.load_state()) == ["actor-load_state", "critic-load_state"]
+        assert trainers["actor"].method_names() == ["load_state"]
+        assert trainers["critic"].method_names() == ["load_state"]
+
+    async def test_load_state_with_a_model_id_reloads_only_that_trainer(self):
+        """Multi policy runs resume one policy at a time, mirroring how they init."""
+        composite, trainers = _make_composite("actor", "critic")
+
+        assert await composite.load_state(model_id="actor") == ["actor-load_state"]
+        assert trainers["critic"].calls == []
+
+    async def test_wait_idle_waits_for_every_trainer(self):
+        """Reloading a checkpoint under a running train step would corrupt it, on any trainer."""
+        composite, trainers = _make_composite("actor", "critic")
+
+        await composite.wait_idle(timeout=42.0)
+
+        assert trainers["actor"].idle_timeouts == [42.0]
+        assert trainers["critic"].idle_timeouts == [42.0]

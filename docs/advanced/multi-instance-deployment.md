@@ -10,7 +10,7 @@ installed one release per instance, and one orchestration script drives all of t
 <Warning>
 
 **Status.** Under active development. The shape below is verified by hand on kubernetes rather than
-in CI, and it is not yet a hot restart.
+in CI.
 
 </Warning>
 
@@ -264,8 +264,8 @@ from miles.rollout.router_addressing import compute_router_url, compute_sample_r
   undefined - rejected with a named instance, because colocated trainers and engines share gpus and are
   therefore one deployment unit, and rejected together with `--expected-registration-reporters`,
   because a registered engine holds gpus of its own deployment.
-- **Not a hot restart.** A new orchestration script does not reattach to running trainers. The
-  registry living inside the inference controller is the seam a hot restart builds on.
+- **No hot restart of its own.** The registry lives inside the inference controller, which outlives
+  the orchestration script; [hot restart](/advanced/hot-restart) is what reattaches a new script to it.
 - **One router, in one place.** A per-datacenter data plane router is a later, purely data-plane
   increment; the controller managing N routers is no different from it managing one.
 - **No per-deployment weighting.** Every engine is a worker of the one router, and the router balances

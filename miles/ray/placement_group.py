@@ -6,6 +6,12 @@ import ray
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from miles.ray.hot_restart import (
+    init_or_resume_inference_controller,
+    init_or_resume_trainer,
+    log_startup_weight_alignment,
+    wait_until_rollout_executor_is_free,
+)
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
 from miles.ray.specs.inference import (
     SESSION_SERVER_POOL_ID,
@@ -149,11 +155,11 @@ async def create_training_models(
     capability = get_backend_capability(args)
 
     actor_model = create_trainer_controller_handle(args, capability=capability, role="actor")
-    actor_start_rollout_ids = await actor_model.init(args)
+    actor_start_rollout_ids = await init_or_resume_trainer(actor_model, args)
 
     if args.use_critic:
         critic_model = create_trainer_controller_handle(args, capability=capability, role="critic")
-        critic_start_rollout_ids = await critic_model.init(compute_critic_args(args))
+        critic_start_rollout_ids = await init_or_resume_trainer(critic_model, compute_critic_args(args))
     else:
         critic_model = None
 
@@ -194,6 +200,8 @@ async def update_weights(
 
     if weight_version is not None:
         await rollout_executor.set_weight_version(weight_version, trainer_model_id=model_id)
+    if rollout_id is None:
+        log_startup_weight_alignment(weight_version=weight_version)
 
 
 async def _maybe_log_inference_engine_weight_checksums(
@@ -245,9 +253,10 @@ async def create_rollout_components(args) -> RolloutComponents:
         await wait_session_server_ready(args, provider=session_server_provider)
 
     inference_controller = create_inference_controller_handle(args, capability=capability)
-    await inference_controller.init()
+    await init_or_resume_inference_controller(inference_controller)
 
     rollout_executor = create_rollout_executor_handle(capability=capability)
+    await wait_until_rollout_executor_is_free(rollout_executor)
     await rollout_executor.init()
 
     # calculate num_rollout from num_epoch

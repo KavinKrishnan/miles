@@ -217,6 +217,22 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
     def get_buffer_length(self):
         return len(self.buffer)
 
+    def save(self, rollout_id):
+        super().save(rollout_id)
+        self.save_buffer(rollout_id)
+
+    def load(self, rollout_id=None):
+        super().load(rollout_id)
+        self.load_buffer(rollout_id)
+
+    def save_buffer(self, rollout_id: int) -> None:
+        """Persist the pending-sample backlog; the default keeps it in memory, so a restart drops it."""
+        logger.debug(f"The buffer of {len(self.buffer)} pending groups is not persisted at rollout {rollout_id}")
+
+    def load_buffer(self, rollout_id: int | None = None) -> None:
+        """Restore the backlog `save_buffer` wrote; a replay buffer implements this pair and nothing else moves."""
+        logger.debug(f"No persisted buffer is restored at rollout {rollout_id}")
+
 
 def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]:
     num_to_pop = min(len(buffer), num_samples)

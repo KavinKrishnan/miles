@@ -8,6 +8,7 @@ import pytest
 from tests.fast.ray.rollout.conftest import make_args
 
 from miles.dashboard import hooks as dashboard_hooks
+from miles.ray.hot_restart import init_or_resume_inference_controller
 from miles.ray.rollout import inference_controller as inference_controller_module
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin
 from miles.ray.rollout.inference_controller import InferenceController
@@ -16,11 +17,20 @@ from miles.ray.rollout.server_cell import ServerCellMetadata, compute_server_cel
 from miles.ray.specs.inference import compute_engine_pool_ids, compute_router_pool_id, specs_inference_engine
 from miles.utils.context_lock import ContextLock
 from miles.utils.ft_utils.health_checker import ActivenessTracker
-from miles.utils.workers.registration.models import RegistrationAck, RegistrationSnapshot, compute_snapshot_digest
+from miles.utils.init_once import InitOnce
+from miles.utils.workers.registration.models import (
+    RegisteredCell,
+    RegisteredWorker,
+    RegistrationAck,
+    RegistrationSnapshot,
+    compute_snapshot_digest,
+)
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
 from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
 from miles.utils.workers.rpc.common.metadata import collect_rpc_method_specs
 from miles.utils.workers.worker_info import WorkerInfo
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, ReconcileFn, StopWatchFn
+from miles.utils.workers.worker_provider.fan_in import FanInWorkerProvider
 from miles.utils.workers.worker_spec import HostAndPort, NamedHostAndPorts, WorkerMetaContext
 
 
@@ -157,6 +167,7 @@ class _RecordingEvalFleet:
 
 def _make_controller(servers: dict, *, engine_provider: _FakeWorkerProvider | None = None) -> InferenceController:
     controller = InferenceController.__new__(InferenceController)
+    controller._init_once = InitOnce(component="InferenceController")
     controller.args = SimpleNamespace(debug_train_only=False, use_fault_tolerance=False, ci_test=False, colocate=False)
     controller.servers = servers
     controller.context_lock = ContextLock("InferenceController")
@@ -776,3 +787,203 @@ class TestEvalFleetSurface:
             skip_reason=None
         )
         assert controller._eval_fleet.pins == [dict(checkpoint_dir="/snap/step_5", weight_version="5")]
+
+
+class TestInitExactlyOnceAndAbortAll:
+    async def test_a_controller_that_never_ran_reports_it_is_not_initialized(self):
+        """An inference deployment that was just installed still has to be initialized by the script."""
+        assert await _make_controller({}).is_initialized() is False
+
+    async def test_a_controller_reports_initialized_after_init(self):
+        """An inference deployment that outlived its orchestration script must be taken over, not rebuilt."""
+        controller = InferenceController(
+            make_args(debug_train_only=True),
+            engine_provider=_FakeWorkerProvider([]),
+            router_providers=[_FakeWorkerProvider([])],
+        )
+
+        await controller.init()
+
+        assert await controller.is_initialized() is True
+
+    async def test_a_second_init_is_refused(self):
+        """It would rebuild the servers and the watcher of engines that are already serving."""
+        controller = InferenceController(
+            make_args(debug_train_only=True),
+            engine_provider=_FakeWorkerProvider([]),
+            router_providers=[_FakeWorkerProvider([])],
+        )
+        await controller.init()
+
+        with pytest.raises(AssertionError, match="already been initialized"):
+            await controller.init()
+
+    async def test_abort_all_reaches_every_server(self):
+        """Orphan generations would otherwise resume under the weights the new script pushes at startup."""
+        first, second = _AbortingServer(), _AbortingServer()
+        controller = _make_controller({"a": first, "b": second})
+
+        assert await controller.abort_all() == []
+        assert first.aborts == 1
+        assert second.aborts == 1
+
+    async def test_the_cells_that_refused_are_answered_across_every_server(self):
+        """The take-over logs them, and a per-server answer would name only the cells of one model."""
+        first = _AbortingServer(refused_cell_ids=["west-0"])
+        second = _AbortingServer(refused_cell_ids=["east-0"])
+        controller = _make_controller({"a": first, "b": second})
+
+        assert sorted(await controller.abort_all()) == ["east-0", "west-0"]
+
+
+class _AbortingServer(_RecordingServer):
+    def __init__(self, *, model_name: str = "model", refused_cell_ids: list[str] | None = None) -> None:
+        super().__init__(model_name=model_name)
+        self.aborts = 0
+        self.aborted_cell_ids: list[list[str]] = []
+        self._refused_cell_ids = refused_cell_ids or []
+
+    async def abort_all(self) -> list[str]:
+        self.aborts += 1
+        self.aborted_cell_ids.append(sorted(self.server_cells))
+        return self._refused_cell_ids
+
+
+_REGISTERED_CELL_ID = "west-inference-engine-0-0-0"
+_REGISTERED_POOL_ID = "west-inference-engine-0-0"
+
+
+def _registered_cell() -> RegisteredCell:
+    return RegisteredCell(
+        cell_id=_REGISTERED_CELL_ID,
+        pool_id=_REGISTERED_POOL_ID,
+        workers_hash="pseudo-hash-west",
+        workers=[
+            RegisteredWorker(
+                name=f"{_REGISTERED_CELL_ID}-0",
+                addrs={"primary": HostAndPort(host="10.9.0.1", port=8000)},
+                gpu_ids=[0],
+            )
+        ],
+        meta=dict(
+            model_id="default",
+            worker_type="regular",
+            num_gpus_per_engine=1,
+            gpu_offset=0,
+            sglang_api_key=None,
+            needs_offload=False,
+            update_weights=True,
+        ),
+    )
+
+
+def _registration_snapshot(cells: list[RegisteredCell], *, sequence: int = 1) -> RegistrationSnapshot:
+    expected = {"default": len(cells)}
+    return RegistrationSnapshot(
+        reporter_id="west",
+        epoch="epoch-1",
+        sequence=sequence,
+        digest=compute_snapshot_digest(cells=cells, expected_num_cells_by_model=expected),
+        expected_num_cells_by_model=expected,
+        cells=cells,
+    )
+
+
+class _IdleHandle:
+    def __init__(self, controller: InferenceController) -> None:
+        self._controller = controller
+        self.idle_timeouts: list[float] = []
+
+    async def wait_idle(self, *, timeout: float) -> None:
+        self.idle_timeouts.append(timeout)
+
+    def __getattr__(self, name: str):
+        return getattr(self._controller, name)
+
+
+class TestATakeOverOfARegisteredEnginePool:
+    @pytest.fixture
+    async def taken_over(self, monkeypatch: pytest.MonkeyPatch):
+        srv = _AbortingServer(model_name="default")
+        _patch_init(monkeypatch, servers={"default": srv})
+        registration_provider = RegistrationWorkerProvider(expected_num_reporters=1)
+        controller = InferenceController(
+            make_args(),
+            engine_provider=FanInWorkerProvider(providers=[_FakeWorkerProvider([]), registration_provider]),
+            router_providers=[_FakeWorkerProvider([])],
+            registration_provider=registration_provider,
+        )
+        await controller.init()
+        await controller.apply_registration_snapshot(_registration_snapshot([_registered_cell()]))
+        await registration_provider._wait_pending_dispatches()
+        try:
+            yield SimpleNamespace(
+                controller=controller, handle=_IdleHandle(controller), provider=registration_provider, srv=srv
+            )
+        finally:
+            await controller.dispose()
+
+    @pytest.mark.asyncio
+    async def test_a_registered_cell_reaches_the_server_of_its_model(self, taken_over):
+        """The take-over is only meaningful if these cells really did arrive through registration."""
+        assert sorted(taken_over.srv.server_cells) == [_REGISTERED_CELL_ID]
+
+    @pytest.mark.asyncio
+    async def test_the_take_over_leaves_the_registered_membership_alone(self, taken_over):
+        """The registry lives in this process, so an orchestration restart has to be invisible to it."""
+        await init_or_resume_inference_controller(taken_over.handle)
+
+        assert taken_over.provider.cell_ids() == [_REGISTERED_CELL_ID]
+        assert sorted(taken_over.srv.server_cells) == [_REGISTERED_CELL_ID]
+
+    @pytest.mark.asyncio
+    async def test_the_take_over_never_re_initializes_the_controller(self, taken_over):
+        """A second init would rebuild the servers the registered engines are already members of."""
+        await init_or_resume_inference_controller(taken_over.handle)
+
+        assert await taken_over.controller.is_initialized() is True
+
+    @pytest.mark.asyncio
+    async def test_the_abort_reaches_the_cells_registration_supplied(self, taken_over):
+        """An engine pool this run never deployed still serves it, so its generations have to stop too."""
+        await init_or_resume_inference_controller(taken_over.handle)
+
+        assert taken_over.srv.aborted_cell_ids == [[_REGISTERED_CELL_ID]]
+
+
+class TestTheWeightUpdateWindowQuery:
+    @pytest.mark.asyncio
+    async def test_a_quiet_controller_reports_no_open_window(self):
+        """An ordinary take-over must not reattach to a lock nobody is holding."""
+        assert await _make_controller({}).is_update_weights_window_open() is False
+
+    @pytest.mark.asyncio
+    async def test_a_controller_inside_a_weight_update_reports_its_open_window(self):
+        """This is the state a script killed mid update leaves behind, and it wedges every locked call."""
+        controller = _make_controller({})
+
+        await controller.start_update_weights()
+
+        assert await controller.is_update_weights_window_open() is True
+
+    @pytest.mark.asyncio
+    async def test_aborting_the_window_frees_the_controller_for_the_abort_that_follows(self):
+        """abort_update_weights is the reset a new orchestration script applies before it stops generations."""
+        controller = _make_controller({"a": _AbortingServer()})
+        await controller.start_update_weights()
+
+        await controller.abort_update_weights()
+        await controller.abort_all()
+
+        assert await controller.is_update_weights_window_open() is False
+        assert controller.servers["a"].aborts == 1
+
+    @pytest.mark.asyncio
+    async def test_a_window_closed_the_ordinary_way_needs_no_reset(self):
+        """end_update_weights releases the lock itself, so a take-over after a clean update resets nothing."""
+        controller = _make_controller({})
+
+        info = await controller.start_update_weights()
+        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+
+        assert await controller.is_update_weights_window_open() is False

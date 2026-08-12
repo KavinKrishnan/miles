@@ -18,6 +18,7 @@ from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, object_store, train_dump_utils
 from miles.utils.argparse_utils import inplace_modify_args
+from miles.utils.arguments import resolve_checkpoint_source
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.context_utils import with_defer
@@ -57,7 +58,7 @@ from .ft.in_memory_checkpoint import InMemoryCheckpointManager
 from .ft.indep_dp import reconfigure_indep_dp_group
 from .initialize import init, is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, lora_rollout_enabled
-from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
+from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, load_model_state, save, train
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
 from .update_weight.common import named_params_and_buffers
@@ -192,6 +193,7 @@ class MegatronTrainRayActor(TrainRayActor):
             checkpointing_context = {"local_checkpoint_manager": ckpt_manager}
         elif args.non_persistent_ckpt_type == "local":
             checkpointing_context = {"local_checkpoint_manager": InMemoryCheckpointManager()}
+        self._reload_checkpointing_context = None if recv_ckpt_src_rank is not None else checkpointing_context
 
         heal_load_overrides: dict[str, object] = (
             dict(no_load_optim=False, no_load_rng=False, finetune=False) if recv_ckpt_src_rank is not None else {}
@@ -296,6 +298,55 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    @with_logs
+    def load_state(self) -> int:
+        assert self.is_initialized(), "load_state reloads the state of a trainer that init already built"
+
+        if self.args.debug_rollout_only:
+            return 0
+
+        if self._asleep:
+            self.wake_up()
+
+        self._refresh_checkpoint_source()
+
+        loaded_rollout_id = load_model_state(
+            self.args,
+            model=self.model,
+            optimizer=self.optimizer,
+            opt_param_scheduler=self.opt_param_scheduler,
+            role=self.role,
+            checkpointing_context=self._reload_checkpointing_context,
+        )
+        self._last_rollout_id = loaded_rollout_id
+
+        if self.role != "critic":
+            if self._enable_weight_backup:
+                self.weights_backuper.backup("actor")
+            if self.with_ref:
+                self.load_other_checkpoint("ref", self.args.ref_load)
+            if self.with_opd_teacher:
+                self.load_other_checkpoint("teacher", self.args.opd_teacher_load)
+            if self.args.keep_old_actor:
+                self.load_other_checkpoint("old_actor", self.args.load)
+                if self.args.update_weights_interval == 1:
+                    self.weights_backuper.backup("rollout_actor")
+            self.loaded_adapters = {}
+            self._multi_lora_pending_push = set()
+            self._switch_model("actor")
+
+        clear_memory()
+        if self.args.offload_train:
+            self.sleep()
+
+        logger.info(f"load_state rolled this trainer back to checkpoint iteration {loaded_rollout_id}")
+        return loaded_rollout_id + 1
+
+    def _refresh_checkpoint_source(self) -> None:
+        resolve_checkpoint_source(self.args)
+        if self.role == "critic":
+            self.args.load = self.args.critic_load
 
     @with_logs
     @timer

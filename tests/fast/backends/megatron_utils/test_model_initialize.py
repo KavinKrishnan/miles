@@ -187,3 +187,118 @@ def test_initialize_steps_scheduler_when_checkpoint_did_not_restore_it():
 
     assert result == (model, optimizer, opt_param_scheduler, 100)
     opt_param_scheduler.step.assert_called_once_with(increment=800)
+
+
+_GLOBAL_BATCH_SIZE = 8
+_CHECKPOINT_NUM_STEPS = 500
+_CHECKPOINT_ITERATION = 100
+
+
+class _FakeScheduler:
+    def __init__(self) -> None:
+        self.num_steps = 0
+
+    def step(self, increment: int) -> None:
+        self.num_steps += increment
+
+
+def _accumulating_load_checkpoint(iteration: int):
+    def _load(model, optimizer, opt_param_scheduler, **kwargs):
+        if opt_param_scheduler is not None and iteration > 0:
+            opt_param_scheduler.step(increment=_CHECKPOINT_NUM_STEPS)
+        return iteration, 0
+
+    return _load
+
+
+def _load_state(scheduler: _FakeScheduler, *, use_checkpoint_scheduler: bool, iteration: int) -> int:
+    from miles.backends.megatron_utils.model import load_model_state
+
+    args = Namespace(use_checkpoint_opt_param_scheduler=use_checkpoint_scheduler, global_batch_size=_GLOBAL_BATCH_SIZE)
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "miles.backends.megatron_utils.model.load_checkpoint",
+                side_effect=_accumulating_load_checkpoint(iteration),
+            )
+        )
+        _patch_initialize_side_effects(stack)
+        return load_model_state(
+            args,
+            model=[_FakeModelChunk()],
+            optimizer=object(),
+            opt_param_scheduler=scheduler,
+            role="actor",
+        )
+
+
+class TestTheSchedulerStateALoadLandsOn:
+    def test_a_cold_load_keeps_the_checkpoints_own_steps_and_adds_the_iteration(self):
+        """Megatron's load_state_dict accumulates, so this sum is the schedule every resume has always used."""
+        scheduler = _FakeScheduler()
+
+        _load_state(scheduler, use_checkpoint_scheduler=False, iteration=_CHECKPOINT_ITERATION)
+
+        assert scheduler.num_steps == _CHECKPOINT_NUM_STEPS + _CHECKPOINT_ITERATION * _GLOBAL_BATCH_SIZE
+
+    def test_a_reload_into_a_live_scheduler_lands_exactly_where_a_cold_load_does(self):
+        """A hot restart reloads into the scheduler object init built, and must not drift from a cold restart."""
+        cold = _FakeScheduler()
+        _load_state(cold, use_checkpoint_scheduler=False, iteration=_CHECKPOINT_ITERATION)
+
+        reloaded = _FakeScheduler()
+        _load_state(reloaded, use_checkpoint_scheduler=False, iteration=_CHECKPOINT_ITERATION)
+        _load_state(reloaded, use_checkpoint_scheduler=False, iteration=_CHECKPOINT_ITERATION)
+
+        assert reloaded.num_steps == cold.num_steps
+
+    def test_a_checkpoint_restored_schedule_is_not_stepped_a_second_time(self):
+        """--use-checkpoint-opt-param-scheduler takes the schedule from the checkpoint and nothing else."""
+        scheduler = _FakeScheduler()
+
+        _load_state(scheduler, use_checkpoint_scheduler=True, iteration=_CHECKPOINT_ITERATION)
+
+        assert scheduler.num_steps == _CHECKPOINT_NUM_STEPS
+
+    def test_a_checkpoint_restored_schedule_does_not_double_on_a_reload(self):
+        """This branch skips the step entirely, so only resetting before the load keeps a reload idempotent."""
+        scheduler = _FakeScheduler()
+
+        _load_state(scheduler, use_checkpoint_scheduler=True, iteration=_CHECKPOINT_ITERATION)
+        _load_state(scheduler, use_checkpoint_scheduler=True, iteration=_CHECKPOINT_ITERATION)
+
+        assert scheduler.num_steps == _CHECKPOINT_NUM_STEPS
+
+    def test_a_run_that_loads_no_checkpoint_starts_its_schedule_at_zero(self):
+        """A fresh run must not inherit a schedule position from anywhere."""
+        scheduler = _FakeScheduler()
+
+        _load_state(scheduler, use_checkpoint_scheduler=False, iteration=0)
+
+        assert scheduler.num_steps == 0
+
+    def test_the_cold_path_through_initialize_lands_on_the_same_value(self):
+        """load_model_state is the load half of initialize, and extracting it must not move the cold path."""
+        from miles.backends.megatron_utils.model import initialize_model_and_optimizer
+
+        scheduler = _FakeScheduler()
+        args = Namespace(use_checkpoint_opt_param_scheduler=False, global_batch_size=_GLOBAL_BATCH_SIZE)
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "miles.backends.megatron_utils.model.setup_model_and_optimizer",
+                    return_value=([_FakeModelChunk()], object(), scheduler),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "miles.backends.megatron_utils.model.load_checkpoint",
+                    side_effect=_accumulating_load_checkpoint(_CHECKPOINT_ITERATION),
+                )
+            )
+            _patch_initialize_side_effects(stack)
+            _, _, _, iteration = initialize_model_and_optimizer(args)
+
+        assert iteration == _CHECKPOINT_ITERATION
+        assert scheduler.num_steps == _CHECKPOINT_NUM_STEPS + _CHECKPOINT_ITERATION * _GLOBAL_BATCH_SIZE

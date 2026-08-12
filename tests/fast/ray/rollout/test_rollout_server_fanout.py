@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,7 @@ def _make_server(cells: list[_RecordingCell], **overrides) -> RolloutServer:
         server_cells={cell.meta.cell_id: cell for cell in cells},
         args=SimpleNamespace(colocate=True),
         context_lock=ContextLock("InferenceController"),
+        engine_provider=SimpleNamespace(),
         **overrides,
     )
 
@@ -112,3 +114,42 @@ class TestCheckWeightsFanOut:
             assert await srv.check_weights(action="snapshot") == []
 
         assert gated.calls == []
+
+
+class _AbortingCell(_RecordingCell):
+    def __init__(self, *, cell_id: str, failure: Exception | None = None):
+        super().__init__(cell_id=cell_id, needs_offload=False)
+        self._failure = failure
+
+    async def abort_all(self):
+        self.calls.append(("abort_all", {}))
+        if self._failure is not None:
+            raise self._failure
+        return f"aborted-{self.meta.cell_id}"
+
+
+class TestAbortFanOut:
+    async def test_every_addressable_cell_is_aborted(self):
+        """A generation left running on one engine pollutes the data of the run that takes the fleet over."""
+        cells = [_AbortingCell(cell_id=str(i)) for i in range(3)]
+        srv = _make_server(cells)
+
+        async with srv.context_lock:
+            refused = await srv.abort_all()
+
+        assert all(cell.calls == [("abort_all", {})] for cell in cells)
+        assert refused == []
+
+    async def test_a_cell_that_refuses_the_abort_does_not_take_the_others_down(self, caplog):
+        """An engine that answers an error is a loud warning, not a reason to fail the whole take-over."""
+        failing = _AbortingCell(cell_id="failing", failure=RuntimeError("engine said no"))
+        healthy = _AbortingCell(cell_id="healthy")
+        srv = _make_server([failing, healthy])
+
+        with caplog.at_level(logging.ERROR):
+            async with srv.context_lock:
+                refused = await srv.abort_all()
+
+        assert healthy.calls == [("abort_all", {})]
+        assert refused == ["failing"]
+        assert "failing" in caplog.text

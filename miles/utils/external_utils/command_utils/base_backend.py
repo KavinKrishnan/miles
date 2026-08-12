@@ -19,7 +19,13 @@ from miles.utils.external_utils.command_utils.common import (
 from miles.utils.external_utils.model_args_utils import shell_safe_model_args
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.typer_utils import dataclass_from_env
-from miles.utils.workers.types import ClusterBackend, DeployComponent, DeploySelector
+from miles.utils.workers.types import (
+    ClusterBackend,
+    DeployComponent,
+    DeploySelector,
+    HotRestartComponent,
+    parse_hot_restart,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,7 @@ class ExecuteTrainConfig:
     cluster_backend: ClusterBackend = ClusterBackend.RAY
     deploy_component: DeployComponent = DeployComponent.ALL
     deploy_instance: str | None = None
+    hot_restart: str = ""
     run_id: str = field(default_factory=create_run_id)
     namespace: str = ""
     helm_values: tuple[str, ...] = ()
@@ -43,6 +50,10 @@ class ExecuteTrainConfig:
     @property
     def deploy_selector(self) -> DeploySelector:
         return DeploySelector(component=self.deploy_component, instance=self.deploy_instance)
+
+    @property
+    def hot_restart_components(self) -> frozenset[HotRestartComponent]:
+        return parse_hot_restart(self.hot_restart)
 
     def create_backend(self) -> BaseCommandBackend:
         match self.cluster_backend:

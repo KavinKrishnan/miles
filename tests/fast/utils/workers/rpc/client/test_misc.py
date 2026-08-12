@@ -79,6 +79,44 @@ class TestBootUuidPin:
         with pytest.raises(ServerRestartedError, match=BOOT_UUID_HEADER):
             pin.verify(_response())
 
+    def test_rebaseline_lets_the_next_response_pin_a_new_value(self) -> None:
+        """wait_ready re-baselines, because a restart during it is expected rather than a violation."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.verify(_response(boot_uuid="boot-a"))
+
+        pin.rebaseline()
+        pin.verify(_response(boot_uuid="boot-b"))
+
+        assert pin.expected == "boot-b"
+
+    def test_a_rebaselined_pin_still_refuses_a_later_change(self) -> None:
+        """Re-baselining widens the window, it does not turn strict mode off."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.rebaseline()
+        pin.verify(_response(boot_uuid="boot-b"))
+
+        with pytest.raises(ServerRestartedError, match="boot-c"):
+            pin.verify(_response(boot_uuid="boot-c"))
+
+    def test_rebaseline_asks_for_a_handshake_again(self) -> None:
+        """A handle whose pin was cleared must re-establish it before it drives a call."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.verify(_response(boot_uuid="boot-a"))
+
+        pin.rebaseline()
+
+        assert pin.needs_handshake() is True
+        assert pin.expected is None
+
+    def test_rebaseline_is_inert_for_an_optional_pin(self) -> None:
+        """A client that tolerates restarts has nothing to re-baseline."""
+        pin = BootUuidPin(required=False, worker_cls_name="Worker")
+
+        pin.rebaseline()
+
+        assert pin.needs_handshake() is False
+        assert pin.expected is None
+
 
 class TestRpcTransport:
     async def test_returns_validated_response_model(self) -> None:

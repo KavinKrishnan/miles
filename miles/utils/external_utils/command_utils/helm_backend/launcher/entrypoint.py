@@ -19,6 +19,7 @@ from miles.utils.external_utils.command_utils.common import ArgvManipulator, cha
 from miles.utils.external_utils.command_utils.helm_backend import naming
 from miles.utils.external_utils.command_utils.helm_backend.launcher import manifest_diff
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import CI_LABEL, Helm, Kubectl
+from miles.utils.external_utils.command_utils.helm_backend.launcher.hot_restart import plan_hot_restart
 from miles.utils.external_utils.command_utils.helm_backend.launcher.launch_record import (
     LaunchRecord,
     installed_launch_record_file,
@@ -82,8 +83,20 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
     Helm.build_dependencies(chart)
 
     installed_manifest = Helm.get_manifest(release, namespace)
+    hot_restart = plan_hot_restart(
+        args,
+        components=config.hot_restart_components,
+        selector=selector,
+        release=release,
+        installed_manifest=installed_manifest,
+    )
     state_file = (
-        _compute_state_file(installed_manifest=installed_manifest, run_directory=run_directory, release=release)
+        _compute_state_file(
+            installed_manifest=installed_manifest,
+            run_directory=run_directory,
+            release=release,
+            restarts_orchestration=hot_restart.restarts_orchestration,
+        )
         if deploys_orchestration_script
         else None
     )
@@ -99,6 +112,8 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
         colocate=bool(args.colocate),
         mooncake_plan=mooncake_plan if deploys_orchestration_script else None,
         prepare_cmd=request.prepare_cmd,
+        restart_at=hot_restart.restart_at,
+        restart_pools=hot_restart.restart_pools,
     )
     values_path = RunFiles.new_values_file(run_directory=run_directory)
     record = LaunchRecord.compute(plan=plan, values_file=values_path)
@@ -121,6 +136,7 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
             chart=chart,
             values_files=values_files,
             force=config.force,
+            rebuilt_object_names=hot_restart.rebuilt_object_names,
         )
 
     record.write(path=record_path)
@@ -199,8 +215,10 @@ def _compute_pod_record_file(*, installed_manifest: Manifest | None, record_path
     return installed_launch_record_file(manifest=installed_manifest, container=naming.ORCHESTRATOR_COMPONENT)
 
 
-def _compute_state_file(*, installed_manifest: Manifest | None, run_directory: Path, release: str) -> Path:
-    if installed_manifest is None:
+def _compute_state_file(
+    *, installed_manifest: Manifest | None, run_directory: Path, release: str, restarts_orchestration: bool
+) -> Path:
+    if installed_manifest is None or restarts_orchestration:
         return RunFiles.new_state_file(run_directory=run_directory)
 
     attached_state_file = installed_manifest.state_file(container=naming.ORCHESTRATOR_COMPONENT)
@@ -219,18 +237,26 @@ def _assert_upgrade_only_resizes(
     chart: Path,
     values_files: list[str | Path],
     force: bool,
+    rebuilt_object_names: frozenset[str],
 ) -> None:
     proposed_manifest = Helm.render_upgrade(
         release=release, namespace=namespace, chart=chart, values_files=values_files
     )
-    diff = manifest_diff.diff_manifests(before=installed_manifest, after=proposed_manifest)
+    diff = manifest_diff.diff_manifests(
+        before=installed_manifest, after=proposed_manifest, rebuilt_object_names=rebuilt_object_names
+    )
 
     if diff.is_allowed:
         logger.info(f"Run {release} already exists; upgrading it:\n{diff.summarize_scaling()}")
         return
 
+    scope = (
+        "more than its size"
+        if not rebuilt_object_names
+        else f"more than the objects this hot restart replaces ({sorted(rebuilt_object_names)})"
+    )
     message = (
-        f"Run {release} already exists and the relaunch would change more than its size:\n"
+        f"Run {release} already exists and the relaunch would change {scope}:\n"
         f"{diff.describe()}\n"
         f"launch under a new run id, or pass force=True to apply this anyway and accept the restarts"
     )

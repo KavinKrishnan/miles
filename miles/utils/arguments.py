@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 ROLLOUT_TOKENIZER_OWNER = "--hf-checkpoint"
 
+CHECKPOINT_SOURCE_DEFAULTS: dict[str, Any] = {
+    "load": None,
+    "ckpt_step": None,
+    "finetune": False,
+    "no_load_optim": False,
+    "no_load_rng": False,
+}
+
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
     """The (rollout, eval) function paths the arguments select."""
@@ -3327,30 +3335,8 @@ def miles_validate_args(args):
             raise ValueError("--opd-teacher-urls is set but --use-opd is not enabled. Please add --use-opd flag.")
 
     # TODO: During loading, we need to set the start_rollout_id here.
-    if args.megatron_to_hf_mode == "bridge":
-        # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference
-        # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
-        # Mirrors the non-bridge branch below.
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.load = args.ref_load or args.hf_checkpoint
-        args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    capture_requested_checkpoint_source(args)
+    resolve_checkpoint_source(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
@@ -3838,6 +3824,47 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     validate_deploy_component(args)
+
+
+def capture_requested_checkpoint_source(args) -> None:
+    for name, default in CHECKPOINT_SOURCE_DEFAULTS.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+
+    args.requested_checkpoint_source = {name: getattr(args, name) for name in CHECKPOINT_SOURCE_DEFAULTS}
+
+
+def resolve_checkpoint_source(args) -> None:
+    for name, value in args.requested_checkpoint_source.items():
+        setattr(args, name, value)
+
+    if args.megatron_to_hf_mode == "bridge":
+        # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference
+        # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
+        # Mirrors the non-bridge branch below.
+        if not _holds_a_checkpoint(args.load):
+            args.load = args.ref_load or args.hf_checkpoint
+        args.start_rollout_id = 0
+        return
+
+    if _holds_a_checkpoint(args.load):
+        return
+
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    args.load = args.ref_load
+    if args.ref_ckpt_step is not None:
+        args.ckpt_step = args.ref_ckpt_step
+    args.start_rollout_id = 0
+
+
+def _holds_a_checkpoint(load_dir: str | None) -> bool:
+    return (
+        load_dir is not None
+        and os.path.exists(load_dir)
+        and os.path.exists(os.path.join(load_dir, "latest_checkpointed_iteration.txt"))
+    )
 
 
 def validate_multi_policy_args(args) -> None:

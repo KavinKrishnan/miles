@@ -33,6 +33,7 @@ from miles.utils.environ import enable_experimental_rollout_refactor
 from miles.utils.function_registry import load_function
 from miles.utils.hf_config import is_complete_hf_export
 from miles.utils.http_utils import init_http_client
+from miles.utils.init_once import InitOnce
 from miles.utils.logging_utils import configure_logger
 from miles.utils.megatron_config import resolve_megatron_config
 from miles.utils.metric_checker import MetricChecker
@@ -66,6 +67,7 @@ class RolloutExecutor(NodeProbeMixin):
         configure_logger(args, source=SimpleProcessIdentity(component="rollout_executor"))
 
         self.args = args
+        self._init_once = InitOnce(component="RolloutExecutor")
         # set by the training actor after each weight update
         self.weight_version: int | None = None
         self._weight_versions: dict[str | None, int] = {}
@@ -77,6 +79,7 @@ class RolloutExecutor(NodeProbeMixin):
         self._inference_controller_provider = inference_controller_provider
 
     async def init(self) -> None:
+        self._init_once.enter()
         args = self.args
         if not args.debug_train_only:
             await resolve_router_addrs(
@@ -123,6 +126,9 @@ class RolloutExecutor(NodeProbeMixin):
         self._metric_checker = MetricChecker.maybe_create(args)
 
     # -------------------------- lifecycle -----------------------------
+
+    def is_initialized(self) -> bool:
+        return self._init_once.is_initialized
 
     def dispose(self) -> None:
         if (close := getattr(self.data_source, "close", None)) is not None:

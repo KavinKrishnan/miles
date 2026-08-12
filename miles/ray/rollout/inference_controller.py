@@ -25,6 +25,7 @@ from miles.utils.context_lock import (
 )
 from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.ft_utils.health_checker import ActivenessTracker
+from miles.utils.init_once import InitOnce
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import NodeProbeMixin, SimpleTicker
 from miles.utils.workers.registration.models import (
@@ -64,6 +65,7 @@ class InferenceController(NodeProbeMixin):
         registration_provider: RegistrationWorkerProvider | None = None,
     ) -> None:
         self.args = args
+        self._init_once = InitOnce(component="InferenceController")
         self._engine_provider = engine_provider
         self._router_providers = router_providers
         self._registration_provider = registration_provider
@@ -78,6 +80,7 @@ class InferenceController(NodeProbeMixin):
 
     @lock_exempt
     async def init(self) -> None:
+        self._init_once.enter()
         configure_logger(self.args, source=SimpleProcessIdentity(component="inference_controller"))
 
         if self.args.debug_train_only:
@@ -104,6 +107,23 @@ class InferenceController(NodeProbeMixin):
         await asyncio.gather(*[srv.wait_expected_num_cells() for srv in self.servers.values()])
 
     # -------------------------- rollout lifecycle hooks -----------------------------
+
+    @lock_exempt
+    async def is_initialized(self) -> bool:
+        return self._init_once.is_initialized
+
+    @lock_exempt
+    async def is_update_weights_window_open(self) -> bool:
+        """Answer whether a `start_update_weights` is still holding the lock its `end_update_weights` never closed."""
+        return self.context_lock.detached
+
+    @with_lock
+    async def abort_all(self) -> list[str]:
+        """Drop every in-flight generation, and answer the cells that refused, so a take-over knows what it left."""
+        refused: list[str] = []
+        for srv in self.servers.values():
+            refused += await srv.abort_all()
+        return refused
 
     @with_lock
     async def prepare_rollout(self, rollout_id: int) -> None:

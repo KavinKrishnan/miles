@@ -10,6 +10,7 @@ from miles.utils.workers.worker_handle import BaseWorkerHandle
 logger = logging.getLogger(__name__)
 
 TRAINER_READY_TIMEOUT_SECONDS = 3600.0
+TRAINER_IDLE_TIMEOUT_SECONDS = 3600.0
 
 
 class CompositeTrainerController:
@@ -27,6 +28,34 @@ class CompositeTrainerController:
 
     async def init(self, args, model_id: str | None = None) -> list[Any]:
         return await self._route(model_id).init(args)
+
+    async def is_initialized(self, model_id: str | None = None) -> bool:
+        if model_id is not None:
+            return await self._route(model_id).is_initialized()
+
+        per_trainer = dict(
+            zip(
+                self._trainers,
+                await asyncio.gather(*[trainer.is_initialized() for trainer in self._trainers.values()]),
+                strict=True,
+            )
+        )
+        assert len(set(per_trainer.values())) == 1, (
+            f"the trainers of this run disagree on whether they are initialized ({per_trainer}); a restarted "
+            f"orchestration script can only resume trainers that are all in the same state, so restart the whole run"
+        )
+        return next(iter(per_trainer.values()))
+
+    async def load_state(self, model_id: str | None = None) -> list[Any]:
+        if model_id is not None:
+            return await self._route(model_id).load_state()
+
+        per_trainer = await asyncio.gather(*[trainer.load_state() for trainer in self._trainers.values()])
+        return [item for sublist in per_trainer for item in sublist]
+
+    async def wait_idle(self, *, timeout: float = TRAINER_IDLE_TIMEOUT_SECONDS) -> None:
+        await asyncio.gather(*[trainer.wait_idle(timeout=timeout) for trainer in self._trainers.values()])
+        logger.info(f"Every trainer of this run finished what it was doing: {sorted(self._trainers)}")
 
     async def train(
         self,
