@@ -6,13 +6,11 @@ miles supports weight transfer through [ModelExpress](https://github.com/ai-dyna
 via `--update-weight-transfer-mode modelexpress`. Each rollout engine pulls the slices its
 own rank needs from per-worker clients over NIXL RDMA, rather than receiving a broadcast.
 
-This mode spans three repositories and all of them are required:
-
-| Repository | Branch | Contains |
-|---|---|---|
-| `radixark/miles` | `kavink/mx-live-refit` | this change: the `modelexpress` transfer mode |
-| [`ai-dynamo/modelexpress`](https://github.com/ai-dynamo/modelexpress/tree/kavink/miles-sglang-refit) | `kavink/miles-sglang-refit` | publisher, reshard receiver, Miles adapter |
-| [`sgl-project/sglang`](https://github.com/KavinKrishnan/sglang/tree/kavink/modelexpress-live-refit) | `kavink/modelexpress-live-refit` | serving-side refit lifecycle and endpoints |
+This integration requires compatible Miles and SGLang endpoint bindings and a
+ModelExpress package/server with the `modelexpress_rl` API. The default publisher
+factory is `modelexpress_rl.integrations.miles.create_miles_publisher`.
+The earlier `modelexpress.integrations.miles` prototype uses a different lifecycle
+and is not compatible with this version.
 
 ## Usage
 
@@ -41,15 +39,23 @@ engine's geometry, which is what lets the two sides disagree about parallelism -
 trainer at EP=2 can feed an engine at EP=1 with the expert dimension rearranged in
 flight.
 
-The refit is bracketed rather than a single call. Generation is paused, the transfer
-runs, and only once every rank reports the weights installed does the trainer commit the
-version. That ordering is what makes a failed refit safe: the previously committed
-version stays intact and servable rather than the engine being left holding half of one
-version and half of another.
+Miles binds each trainer's stable Megatron storage once, gathers its source slot,
+and creates an exact MX weight version. It pauses the selected rollout fleet,
+publishes all source shards, marks the version READY, then sends its opaque
+`version_id` together with the monotonically increasing `target_training_step`.
+Each SGLang rank stages, verifies coverage, and installs through the shared
+`ModelExpressGeneratorClient`. Miles requires every selected rank to acknowledge
+the exact version before ending the engine update and resuming generation.
 
-Rank 0 performs the commit, and the other trainer ranks wait on a gloo barrier before
-returning. Without the barrier they re-enter framework code while the commit is still in
-flight, and the version check races.
+READY describes source availability. Retirement releases trainer resources; it
+does not activate the rollout fleet. Miles retires versions and releases source
+shards on error paths too. Active leases prevent premature source reuse.
+
+Staging does not change live weights. Installation copies in place, so a partial
+copy failure can leave a mixed version and has no rollback guarantee. Failed
+workers and rounds remain fenced and require restart. Rank-zero lifecycle errors
+are shared with the other trainer ranks, preventing them from continuing training
+while the rollout fleet is incomplete.
 
 ## What resharding does and does not save
 
@@ -73,23 +79,21 @@ mutually unreachable NICs. This does not fail loudly -- it corrupts weights. Set
 **Leave `expandable_segments` off.** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 interferes with NIXL memory registration.
 
-## Performance
+## Performance and validation
 
-The bottleneck is control discovery, not wire transfer. This is worth stating plainly
-because the first measurements suggested the opposite: they were taken with trainer and
-rollout on the same host, where the transfer never touched the network and simply
-measured NVLink. Once genuinely cross-host, wire time becomes a large minority of a warm
-refit and runs near a single NIC's line rate, while discovery dominates the remainder.
+Measure trainer and rollout on separate hosts, with the same model, parallelism,
+NIC and verification settings. Keep cold setup separate from warm reuse and use
+the slowest rank for each version. `MX_REFIT_TIMING` records receiver discovery,
+capture, planning, registration, wire transfer, transformation and installation;
+framework timing additionally includes publication and fleet coordination.
 
-Two implications. Same-host figures should not be quoted as transport measurements. And
-the optimisation target is discovery cost, not bandwidth.
-
-## Validated
-
-Qwen3-30B-A3B (`Qwen3MoeForCausalLM`), trainer and rollout on separate hosts, verified
-with `--check-weight-update-equal`: full parameter coverage, weight equality clean,
-automatic replan when a rollout engine is replaced, and the prior committed version
-preserved under injected pre-install failures.
+The supported integration surface is Qwen3 dense/MoE BF16. Coverage validation is
+unconditional. `--check-weight-update-equal` compares the initial refit with a
+native load; it does not prove byte equality for every subsequent trained version.
+`MX_RESHARD_PUBLISH_DIGEST` enables additional full-shard integrity checking at a
+transfer cost. Quantization, LoRA, speculative models and unsupported storage
+layouts are rejected. Prototype results do not establish validation of this API
+migration; record correctness and performance for the exact source revisions used.
 
 ## Related
 

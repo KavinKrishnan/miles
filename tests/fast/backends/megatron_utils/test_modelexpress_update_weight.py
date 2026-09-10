@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from miles.backends.megatron_utils.update_weight import modelexpress as mx
+from miles.backends.megatron_utils.update_weight import modelexpress_round as mxround
 from miles.utils.arguments import get_miles_extra_args_provider
 from miles.utils.types import ParamInfo
 
@@ -108,7 +109,9 @@ def test_runtime_import_has_no_fallback(monkeypatch):
 
 
 def test_concrete_modelexpress_adapter_is_loaded_by_default(monkeypatch):
-    factory = lambda: object()
+    def factory():
+        return object()
+
     module = SimpleNamespace(create_miles_publisher=factory)
     monkeypatch.setattr(mx.importlib, "import_module", lambda name: module)
 
@@ -133,6 +136,16 @@ class _Engine:
             lambda **kw: events.append(("receiver", kw))
             or {
                 "success": True,
+                "workers": [
+                    {
+                        "rank": 0,
+                        "response": {
+                            "success": True,
+                            "version_id": kw["payload"]["version_id"],
+                            "installed_training_step": kw["payload"]["target_training_step"],
+                        },
+                    }
+                ],
                 "target_training_step": kw["payload"]["target_training_step"],
                 "installed_training_step": kw["payload"]["target_training_step"],
                 "layout_signature": "test-layout",
@@ -155,6 +168,21 @@ class _Publisher:
 
     def configure(self, registration):
         self.registrations.append(registration)
+
+    def prepare(self, tensors):
+        return "slot-0"
+
+    def create_version(self, *, source_slots, step, update_id):
+        return f"mx-{step}"
+
+    def mark_ready(self, version_id):
+        self.events.append(("ready", version_id))
+
+    def retire(self, version_id):
+        self.events.append(("retire", version_id))
+
+    def release(self, version_id):
+        self.events.append(("release", version_id))
 
     def publish_and_execute(self, request):
         self.events.append(("publisher", request))
@@ -247,7 +275,9 @@ def test_qwen3_row_replicated_and_tp_geometry():
     assert (vocab.global_shape, vocab.shard_axis, vocab.local_shard_range) == ((20, 8), 0, (10, 20))
 
 
-def _moe_spec(name, shape, *, tp=False, dim=-1, stride=1, tp_rank=0, tp_size=2, ep_rank=1, ep_size=2, etp_rank=1, etp_size=2):
+def _moe_spec(
+    name, shape, *, tp=False, dim=-1, stride=1, tp_rank=0, tp_size=2, ep_rank=1, ep_size=2, etp_rank=1, etp_size=2
+):
     return mx.build_qwen3moe_published_tensor_spec(
         _args(num_experts=8),
         _info(name, shape, tp=tp, dim=dim, stride=stride),
@@ -480,7 +510,9 @@ def test_qwen3moe_requires_explicit_etp_metadata():
 
 @pytest.fixture
 def runtime(monkeypatch):
-    group = lambda rank=0, size=1: SimpleNamespace(rank=rank, size=size, group=None)
+    def group(rank=0, size=1):
+        return SimpleNamespace(rank=rank, size=size, group=None)
+
     parallel_state = SimpleNamespace(
         tp=group(1, 2),
         pp=group(0, 2),
@@ -491,6 +523,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(mx, "get_parallel_state", lambda: parallel_state)
     monkeypatch.setattr(mx, "named_params_and_buffers", lambda args, model: [])
     monkeypatch.setattr(mx, "get_gloo_group", lambda: None)
+    monkeypatch.setattr(mxround, "get_gloo_group", lambda: None)
     monkeypatch.setattr(mx.dist, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(mx.dist, "get_world_size", lambda *args, **kwargs: 1)
     monkeypatch.setattr(mx.dist, "barrier", lambda *args, **kwargs: None)
@@ -499,7 +532,7 @@ def runtime(monkeypatch):
         "all_gather_object",
         lambda output, value, **kwargs: output.__setitem__(0, value),
     )
-    monkeypatch.setattr(mx.ray, "get", lambda value: value)
+    monkeypatch.setattr(mxround.ray, "get", lambda value, **kwargs: value)
 
 
 def test_qwen3moe_expert_data_parallel_fails_closed(runtime, monkeypatch):
@@ -556,7 +589,9 @@ def test_qwen3moe_nonowner_ep_rank_publishes_only_routed_experts(runtime, monkey
     expert = torch.empty((24, 8), dtype=torch.bfloat16)
     router = torch.empty((8, 8), dtype=torch.bfloat16)
     monkeypatch.setattr(mx, "_source_geometry", lambda: geometry)
-    monkeypatch.setattr(mx, "named_params_and_buffers", lambda args, model: [(expert_name, expert), (router_name, router)])
+    monkeypatch.setattr(
+        mx, "named_params_and_buffers", lambda args, model: [(expert_name, expert), (router_name, router)]
+    )
     monkeypatch.setattr(mx, "get_atomic_update_groups", lambda args, model_name: ())
     monkeypatch.setattr(
         mx,
@@ -583,9 +618,7 @@ def test_qwen3moe_nonowner_ep_rank_publishes_only_routed_experts(runtime, monkey
     assert units == ((expert_name,),)
 
 
-def test_qwen3moe_ep_rank_publishes_when_ordinary_dp_rank_is_nonzero(
-    runtime, monkeypatch
-):
+def test_qwen3moe_ep_rank_publishes_when_ordinary_dp_rank_is_nonzero(runtime, monkeypatch):
     geometry = {
         "global_rank": 1,
         "tp_rank": 0,
@@ -618,7 +651,7 @@ def test_qwen3moe_ep_rank_publishes_when_ordinary_dp_rank_is_nonzero(
     assert updater.publisher is publisher
 
 
-def test_receiver_starts_before_publish_and_version_propagates(runtime):
+def test_exact_version_is_ready_before_receive_and_retired_before_resume(runtime):
     events = []
     publisher = _Publisher(events)
     updater = mx.UpdateWeightFromModelExpress(
@@ -630,18 +663,19 @@ def test_receiver_starts_before_publish_and_version_propagates(runtime):
         publisher_factory=lambda: publisher,
         param_infos=[],
     )
-    updater.connect_rollout_engines([_Engine("rollout-a", events)], object(), [4], [12])
+    updater.connect_rollout_engines([_Engine("rollout-a", events)], object(), [1], [12])
 
     updater.update_weights()
     updater.update_weights()
 
     names = [name for name, _value in events]
-    assert names.index("receiver") < names.index("publisher")
-    assert [request.version for request in publisher.requests] == ["1", "2"]
+    assert names.index("publisher") < names.index("ready") < names.index("receiver")
+    assert names.index("receiver") < names.index("retire") < names.index("release") < names.index("continue")
+    assert [request.version for request in publisher.requests] == ["mx-1", "mx-2"]
     assert [request.training_step for request in publisher.requests] == [1, 2]
     receiver_payloads = [value["payload"] for name, value in events if name == "receiver"]
     assert [payload["target_training_step"] for payload in receiver_payloads] == [1, 2]
-    assert receiver_payloads[0] == {"target_training_step": 1, "logical_group": "model"}
+    assert receiver_payloads[0] == {"version_id": "mx-1", "target_training_step": 1, "logical_group": "model"}
     assert publisher.requests[0].source_geometry["tp_rank"] == 1
 
 
@@ -669,7 +703,9 @@ def test_worker_set_change_reconfigures_cohort(runtime):
 
 
 def test_nonzero_data_parallel_replica_does_not_publish(runtime, monkeypatch):
-    group = lambda rank=0, size=1: SimpleNamespace(rank=rank, size=size, group=None)
+    def group(rank=0, size=1):
+        return SimpleNamespace(rank=rank, size=size, group=None)
+
     monkeypatch.setattr(
         mx,
         "get_parallel_state",
@@ -695,10 +731,11 @@ def test_nonzero_data_parallel_replica_does_not_publish(runtime, monkeypatch):
     )
     updater.connect_rollout_engines([_Engine("rollout-a", events)], object())
 
+    monkeypatch.setattr(mx.dist, "get_rank", lambda: 1)
     updater.update_weights()
 
     assert "publisher" not in [name for name, _value in events]
-    assert "continue" in [name for name, _value in events]
+    assert "continue" not in [name for name, _value in events]
 
 
 def test_publisher_failure_does_not_finalize_or_resume(runtime):
@@ -725,7 +762,8 @@ def test_publisher_failure_does_not_finalize_or_resume(runtime):
         updater.update_weights()
 
     names = [name for name, _value in events]
-    assert "receiver" in names
+    assert "receiver" not in names
+    assert "retire" in names and "release" in names
     assert not {"end", "version", "continue"} & set(names)
 
 
@@ -763,3 +801,75 @@ def test_receiver_failure_response_fails_closed(runtime):
     names = [name for name, _value in events]
     assert "publisher" in names
     assert not {"end", "version", "continue"} & set(names)
+
+
+@pytest.mark.parametrize("failure_phase", ["pause", "end", "version"])
+def test_root_lifecycle_failure_fences_later_rounds(runtime, failure_phase):
+    events = []
+    publisher = _Publisher(events)
+    engine = _Engine("rollout-a", events)
+    attr = {"pause": "pause_generation", "end": "end_weight_update", "version": "update_weight_version"}[failure_phase]
+    setattr(engine, attr, _RemoteMethod(lambda **kwargs: (_ for _ in ()).throw(RuntimeError("injected failure"))))
+    updater = mx.UpdateWeightFromModelExpress(
+        _args(),
+        model=[],
+        weights_getter=lambda: {},
+        model_name="qwen3config",
+        quantization_config=None,
+        publisher_factory=lambda: publisher,
+        param_infos=[],
+    )
+    updater.connect_rollout_engines([engine], object(), [1], [0])
+    with pytest.raises(RuntimeError, match="injected failure"):
+        updater.update_weights()
+    names = [name for name, _ in events]
+    assert "retire" in names and "release" in names
+    assert "continue" not in names
+    with pytest.raises(RuntimeError, match="prior ModelExpress round failed"):
+        updater.update_weights()
+
+
+@pytest.mark.parametrize("bad_ack", ["version", "step", "missing_rank", "duplicate_rank", "poisoned"])
+def test_invalid_rank_acknowledgement_prevents_fleet_activation(runtime, bad_ack):
+    events = []
+    publisher = _Publisher(events)
+    engine = _Engine("rollout-a", events)
+
+    def receive(**kwargs):
+        payload = kwargs["payload"]
+        response = {
+            "success": True,
+            "version_id": payload["version_id"],
+            "installed_training_step": payload["target_training_step"],
+        }
+        workers = [{"rank": rank, "response": dict(response)} for rank in (0, 1)]
+        if bad_ack == "version":
+            workers[1]["response"]["version_id"] = "other-version"
+        elif bad_ack == "step":
+            workers[1]["response"]["installed_training_step"] -= 1
+        elif bad_ack == "missing_rank":
+            workers.pop()
+        elif bad_ack == "duplicate_rank":
+            workers[1]["rank"] = 0
+        else:
+            workers[1]["response"]["receiver_poisoned"] = True
+        return {"success": True, "workers": workers}
+
+    engine.update_weights_from_modelexpress = _RemoteMethod(receive)
+    updater = mx.UpdateWeightFromModelExpress(
+        _args(),
+        model=[],
+        weights_getter=lambda: {},
+        model_name="qwen3config",
+        quantization_config=None,
+        publisher_factory=lambda: publisher,
+        param_infos=[],
+    )
+    updater.connect_rollout_engines([engine], object(), [2], [0])
+    with pytest.raises(RuntimeError, match="ModelExpress receiver"):
+        updater.update_weights()
+    names = [name for name, _ in events]
+    assert "retire" in names and "release" in names
+    assert not {"end", "version", "continue"} & set(names)
+    with pytest.raises(RuntimeError, match="prior ModelExpress round failed"):
+        updater.update_weights()

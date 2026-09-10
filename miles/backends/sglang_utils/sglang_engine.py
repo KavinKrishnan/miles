@@ -300,10 +300,12 @@ class SGLangEngine(RayActor):
         This wrapper deliberately has no alternate transport: an SGLang build
         without the endpoint is incompatible and fails the refit.
         """
-        allowed = {"target_training_step", "logical_group", "expected_layout_signature"}
+        allowed = {"version_id", "target_training_step", "logical_group", "expected_layout_signature"}
         unknown = set(payload) - allowed
         if unknown:
             raise ValueError(f"Unsupported ModelExpress SGLang request fields: {sorted(unknown)}")
+        if not isinstance(payload.get("version_id"), str) or not payload["version_id"]:
+            raise ValueError("ModelExpress update payload requires an exact version_id")
         if "target_training_step" not in payload:
             raise ValueError("ModelExpress update payload is missing target_training_step")
         target_training_step = payload["target_training_step"]

@@ -9,7 +9,6 @@ from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
-import ray
 import torch
 import torch.distributed as dist
 from ray.actor import ActorHandle
@@ -19,16 +18,7 @@ from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.misc import load_function
 from miles.utils.types import ParamInfo
 
-from .common import (
-    _check_weight_sync_results,
-    begin_weight_update,
-    end_weight_update,
-    get_atomic_update_groups,
-    get_named_update_units,
-    is_routed_expert_param,
-    named_params_and_buffers,
-    weight_update_selector,
-)
+from .common import get_atomic_update_groups, get_named_update_units, is_routed_expert_param, named_params_and_buffers
 
 MODELEXPRESS_LOGICAL_GROUP = "model"
 
@@ -98,7 +88,17 @@ class ModelExpressPublisher(Protocol):
 
     def configure(self, registration: ModelExpressTrainerRegistration) -> None: ...
 
+    def prepare(self, tensors: Sequence[ModelExpressPublishedTensorSpec]) -> str: ...
+
+    def create_version(self, *, source_slots: Sequence[str], step: int, update_id: str) -> str: ...
+
     def publish_and_execute(self, request: ModelExpressPublishRequest) -> None: ...
+
+    def mark_ready(self, version_id: str) -> None: ...
+
+    def retire(self, version_id: str) -> None: ...
+
+    def release(self, version_id: str) -> None: ...
 
 
 PublisherFactory = Callable[[], ModelExpressPublisher]
@@ -146,7 +146,7 @@ def load_modelexpress_publisher_factory(adapter_path: str | None) -> PublisherFa
         return factory
 
     try:
-        module = importlib.import_module("modelexpress.integrations.miles")
+        module = importlib.import_module("modelexpress_rl.integrations.miles")
     except ImportError as exc:
         raise RuntimeError(
             "ModelExpress transfer was selected, but the 'modelexpress' package is not installed. "
@@ -157,7 +157,7 @@ def load_modelexpress_publisher_factory(adapter_path: str | None) -> PublisherFa
     if factory is None:
         raise RuntimeError(
             "The installed ModelExpress runtime is incompatible with the Miles publisher protocol; "
-            "modelexpress.integrations.miles.create_miles_publisher is missing."
+            "modelexpress_rl.integrations.miles.create_miles_publisher is missing."
         )
     return factory
 
@@ -251,7 +251,9 @@ def build_qwen3_published_tensor_spec(
     if tensor.dtype != torch.bfloat16:
         raise ValueError(f"ModelExpress requires BF16 tensors; {info.name} has {tensor.dtype}")
     if tuple(tensor.shape) != tuple(info.shape):
-        raise ValueError(f"ModelExpress metadata shape mismatch for {info.name}: {tuple(info.shape)} != {tuple(tensor.shape)}")
+        raise ValueError(
+            f"ModelExpress metadata shape mismatch for {info.name}: {tuple(info.shape)} != {tuple(tensor.shape)}"
+        )
 
     attrs = info.attrs
     tensor_parallel = bool(attrs.get("tensor_model_parallel", False))
@@ -261,9 +263,7 @@ def build_qwen3_published_tensor_spec(
     partition_dim = int(attrs.get("partition_dim", -1))
     partition_stride = int(attrs.get("partition_stride", 1))
     if tensor_parallel and not (0 <= partition_dim < tensor.ndim):
-        raise ValueError(
-            f"ModelExpress cannot register TP shard {info.name}: invalid partition_dim={partition_dim}"
-        )
+        raise ValueError(f"ModelExpress cannot register TP shard {info.name}: invalid partition_dim={partition_dim}")
     if partition_stride < 1:
         raise ValueError(f"ModelExpress cannot register {info.name}: invalid partition_stride={partition_stride}")
 
@@ -321,9 +321,7 @@ def build_qwen3_published_tensor_spec(
         }
     elif placement_role == "gate_up":
         if not tensor_parallel or partition_dim != 0 or partition_stride != 2:
-            raise ValueError(
-                f"Dense Qwen3 gate/up must be TP-sharded on axis 0 with partition_stride=2: {info.name}"
-            )
+            raise ValueError(f"Dense Qwen3 gate/up must be TP-sharded on axis 0 with partition_stride=2: {info.name}")
         hidden_size = int(args.hidden_size)
         ffn_hidden_size = int(args.ffn_hidden_size)
         expected_shape = (2 * ffn_hidden_size, hidden_size)
@@ -334,7 +332,13 @@ def build_qwen3_published_tensor_spec(
             )
         alias_extent = ffn_hidden_size // tp_size
         aliases = tuple(
-            _alias(name, alias_role, (ffn_hidden_size, hidden_size), 0, (tp_rank * alias_extent, (tp_rank + 1) * alias_extent))
+            _alias(
+                name,
+                alias_role,
+                (ffn_hidden_size, hidden_size),
+                0,
+                (tp_rank * alias_extent, (tp_rank + 1) * alias_extent),
+            )
             for name, alias_role in zip(hf_names, ("gate", "up"), strict=True)
         )
         placement_kind = "gate_up_tp"
@@ -358,7 +362,15 @@ def build_qwen3_published_tensor_spec(
         canonical_range = None
         if local_range is not None:
             canonical_range = (min(local_range[0], vocab_size), min(local_range[1], vocab_size))
-        aliases = (_alias(hf_names[0], role, (vocab_size, native_global_shape[1]), 0 if tensor_parallel else None, canonical_range),)
+        aliases = (
+            _alias(
+                hf_names[0],
+                role,
+                (vocab_size, native_global_shape[1]),
+                0 if tensor_parallel else None,
+                canonical_range,
+            ),
+        )
         if tensor_parallel:
             placement_kind = "contiguous_tp"
         conversion_metadata = {
@@ -448,7 +460,9 @@ def build_qwen3moe_published_tensor_spec(
     if tensor.dtype != torch.bfloat16:
         raise ValueError(f"ModelExpress requires BF16 tensors; {info.name} has {tensor.dtype}")
     if tuple(tensor.shape) != tuple(info.shape):
-        raise ValueError(f"ModelExpress metadata shape mismatch for {info.name}: {tuple(info.shape)} != {tuple(tensor.shape)}")
+        raise ValueError(
+            f"ModelExpress metadata shape mismatch for {info.name}: {tuple(info.shape)} != {tuple(tensor.shape)}"
+        )
 
     hidden_size = _required_positive_int(args, "hidden_size")
     num_experts = _required_positive_int(args, "num_experts")
@@ -510,13 +524,8 @@ def build_qwen3moe_published_tensor_spec(
                 expected_global = (hidden_size, moe_ffn)
                 shard_axis, expected_stride = 1, 1
             if etp_size > 1 and not reported_tp:
-                raise ValueError(
-                    f"Qwen3MoE routed {projection} is missing explicit ETP "
-                    f"metadata for {info.name}"
-                )
-            if etp_size > 1 and reported_tp and (
-                reported_dim != shard_axis or reported_stride != expected_stride
-            ):
+                raise ValueError(f"Qwen3MoE routed {projection} is missing explicit ETP " f"metadata for {info.name}")
+            if etp_size > 1 and reported_tp and (reported_dim != shard_axis or reported_stride != expected_stride):
                 raise ValueError(
                     f"Qwen3MoE routed {projection} reports incompatible ETP metadata for {info.name}: "
                     f"partition_dim={reported_dim}, partition_stride={reported_stride}"
@@ -532,9 +541,7 @@ def build_qwen3moe_published_tensor_spec(
             )
             if placement == "gate_up":
                 if moe_ffn % etp_size:
-                    raise ValueError(
-                        f"Qwen3MoE routed expert width {moe_ffn} must divide ETP size {etp_size}"
-                    )
+                    raise ValueError(f"Qwen3MoE routed expert width {moe_ffn} must divide ETP size {etp_size}")
                 alias_extent = moe_ffn // etp_size
                 aliases = tuple(
                     _alias(
@@ -616,11 +623,7 @@ def build_qwen3moe_published_tensor_spec(
                     (
                         hidden_size,
                         _required_positive_int(args, "num_attention_heads")
-                        * int(
-                            args.kv_channels
-                            or hidden_size
-                            // _required_positive_int(args, "num_attention_heads")
-                        ),
+                        * int(args.kv_channels or hidden_size // _required_positive_int(args, "num_attention_heads")),
                     ),
                 ),
                 "mlp.linear_fc1.weight": (
@@ -629,14 +632,54 @@ def build_qwen3moe_published_tensor_spec(
                     "dense_gate_up",
                     (2 * dense_ffn, hidden_size),
                 ),
-                "mlp.linear_fc2.weight": ("row", (f"{prefix}.mlp.down_proj.weight",), "dense_down", (hidden_size, dense_ffn)),
-                "self_attention.linear_qkv.layer_norm_weight": ("replicated", (f"{prefix}.input_layernorm.weight",), "input_norm", (hidden_size,)),
-                "mlp.linear_fc1.layer_norm_weight": ("replicated", (f"{prefix}.post_attention_layernorm.weight",), "post_attention_norm", (hidden_size,)),
-                "pre_mlp_layernorm.weight": ("replicated", (f"{prefix}.post_attention_layernorm.weight",), "post_attention_norm", (hidden_size,)),
-                "self_attention.q_layernorm.weight": ("replicated", (f"{prefix}.self_attn.q_norm.weight",), "q_norm", (int(args.kv_channels or hidden_size // int(args.num_attention_heads)),)),
-                "self_attention.k_layernorm.weight": ("replicated", (f"{prefix}.self_attn.k_norm.weight",), "k_norm", (int(args.kv_channels or hidden_size // int(args.num_attention_heads)),)),
-                "mlp.router.weight": ("replicated", (f"{prefix}.mlp.gate.weight",), "router", (num_experts, hidden_size)),
-                "mlp.router.expert_bias": ("replicated", (f"{prefix}.mlp.gate.e_score_correction_bias",), "expert_bias", (num_experts,)),
+                "mlp.linear_fc2.weight": (
+                    "row",
+                    (f"{prefix}.mlp.down_proj.weight",),
+                    "dense_down",
+                    (hidden_size, dense_ffn),
+                ),
+                "self_attention.linear_qkv.layer_norm_weight": (
+                    "replicated",
+                    (f"{prefix}.input_layernorm.weight",),
+                    "input_norm",
+                    (hidden_size,),
+                ),
+                "mlp.linear_fc1.layer_norm_weight": (
+                    "replicated",
+                    (f"{prefix}.post_attention_layernorm.weight",),
+                    "post_attention_norm",
+                    (hidden_size,),
+                ),
+                "pre_mlp_layernorm.weight": (
+                    "replicated",
+                    (f"{prefix}.post_attention_layernorm.weight",),
+                    "post_attention_norm",
+                    (hidden_size,),
+                ),
+                "self_attention.q_layernorm.weight": (
+                    "replicated",
+                    (f"{prefix}.self_attn.q_norm.weight",),
+                    "q_norm",
+                    (int(args.kv_channels or hidden_size // int(args.num_attention_heads)),),
+                ),
+                "self_attention.k_layernorm.weight": (
+                    "replicated",
+                    (f"{prefix}.self_attn.k_norm.weight",),
+                    "k_norm",
+                    (int(args.kv_channels or hidden_size // int(args.num_attention_heads)),),
+                ),
+                "mlp.router.weight": (
+                    "replicated",
+                    (f"{prefix}.mlp.gate.weight",),
+                    "router",
+                    (num_experts, hidden_size),
+                ),
+                "mlp.router.expert_bias": (
+                    "replicated",
+                    (f"{prefix}.mlp.gate.e_score_correction_bias",),
+                    "expert_bias",
+                    (num_experts,),
+                ),
             }
             if rest in ("self_attention.linear_qkv.weight", "self_attention.linear_qkv.bias"):
                 num_heads = _required_positive_int(args, "num_attention_heads")
@@ -749,7 +792,11 @@ def build_qwen3moe_published_tensor_spec(
         if num_heads % tp_size or num_query_groups % tp_size:
             raise ValueError("Qwen3MoE QKV heads/query groups must divide the trainer TP size")
         tail = (hidden_size,) if tensor.ndim == 2 else ()
-        alias_shapes = ((num_heads * head_dim, *tail), (num_query_groups * head_dim, *tail), (num_query_groups * head_dim, *tail))
+        alias_shapes = (
+            (num_heads * head_dim, *tail),
+            (num_query_groups * head_dim, *tail),
+            (num_query_groups * head_dim, *tail),
+        )
         aliases = tuple(
             _alias(
                 name,
@@ -951,8 +998,7 @@ class UpdateWeightFromModelExpress:
             self.publisher = factory()
             if not isinstance(self.publisher, ModelExpressPublisher):
                 raise TypeError(
-                    "ModelExpress publisher adapter must implement configure() "
-                    "and publish_and_execute()"
+                    "ModelExpress publisher adapter must implement configure() " "and publish_and_execute()"
                 )
         if param_infos is None:
             from .hf_weight_iterator_direct import _get_megatron_local_param_infos
@@ -996,7 +1042,7 @@ class UpdateWeightFromModelExpress:
             )
         self._connection_stale = False
 
-    def _receiver_payload(self) -> dict[str, object]:
+    def _receiver_payload(self, version_id: str) -> dict[str, object]:
         """Build only fields accepted by the upstream MX SGLang worker.
 
         Cohort identity and Miles' string weight version remain trainer-side
@@ -1004,6 +1050,7 @@ class UpdateWeightFromModelExpress:
         """
         return {
             "target_training_step": self.weight_version,
+            "version_id": version_id,
             "logical_group": MODELEXPRESS_LOGICAL_GROUP,
         }
 
@@ -1055,89 +1102,9 @@ class UpdateWeightFromModelExpress:
 
     @torch.no_grad()
     def update_weights(self) -> None:
-        if self.rollout_engines is None:
-            raise RuntimeError("ModelExpress rollout engines are not connected")
-        preparation_error = None
-        try:
-            tensors, atomic_units = self._published_tensors_and_units()
-        except Exception as exc:
-            preparation_error = exc
-            tensors, atomic_units = [], ()
-        preparation_statuses = [None] * dist.get_world_size()
-        dist.all_gather_object(
-            preparation_statuses,
-            None if preparation_error is None else f"{type(preparation_error).__name__}: {preparation_error}",
-            group=get_gloo_group(),
-        )
-        if any(status is not None for status in preparation_statuses):
-            raise RuntimeError(
-                f"ModelExpress tensor geometry preparation failed on trainer ranks: {preparation_statuses}"
-            ) from preparation_error
+        from miles.backends.megatron_utils.update_weight.modelexpress_round import run_update
 
-        self.weight_version += 1
-        selector = weight_update_selector(self.args)
-        if dist.get_rank() == 0:
-            mode = self.args.pause_generation_mode
-            ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
-            if mode != "in_place":
-                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            begin_weight_update(self.rollout_engines, selector)
-            receiver_refs = [
-                engine.update_weights_from_modelexpress.remote(
-                    payload=self._receiver_payload(),
-                    timeout=getattr(self.args, "modelexpress_update_timeout", 600.0),
-                )
-                for engine in self.rollout_engines
-            ]
-        else:
-            receiver_refs = []
-
-        # Receiver pulls must already be live before any publisher starts exposing
-        # temporary buffers. Every trainer rank participates with its local client.
-        dist.barrier(group=get_gloo_group())
-        publish_error = None
-        try:
-            if self._publishes:
-                assert self.publisher is not None
-                self.publisher.publish_and_execute(
-                    ModelExpressPublishRequest(
-                        version=str(self.weight_version),
-                        training_step=self.weight_version,
-                        logical_group=MODELEXPRESS_LOGICAL_GROUP,
-                        cohort_id=self.cohort_id,
-                        worker_id=self.worker_id,
-                        source_geometry=self.source_geometry,
-                        tensors=tensors,
-                        atomic_units=atomic_units,
-                    )
-                )
-        except Exception as exc:
-            publish_error = exc
-        publish_statuses = [None] * dist.get_world_size()
-        dist.all_gather_object(
-            publish_statuses,
-            None if publish_error is None else f"{type(publish_error).__name__}: {publish_error}",
-            group=get_gloo_group(),
-        )
-        if any(status is not None for status in publish_statuses):
-            raise RuntimeError(f"ModelExpress publisher failed closed on trainer ranks: {publish_statuses}") from publish_error
-        if dist.get_rank() == 0:
-            _check_weight_sync_results(ray.get(receiver_refs), is_lora=False)
-        dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
-            end_weight_update(self.rollout_engines)
-            ray.get(
-                [
-                    engine.update_weight_version.remote(weight_version=str(self.weight_version))
-                    for engine in self.rollout_engines
-                ]
-            )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        # Nonzero trainer ranks must not return to framework code while rank zero
-        # is still finalizing or committing the rollout version. In particular,
-        # Miles' CI version check runs on every trainer rank and otherwise races
-        # the rank-zero /update_weight_version calls.
-        dist.barrier(group=get_gloo_group())
+        run_update(self)
 
     def pop_metrics(self) -> dict[str, float]:
         return {}
