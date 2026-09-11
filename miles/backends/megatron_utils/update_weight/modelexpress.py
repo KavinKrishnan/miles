@@ -18,7 +18,7 @@ from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.misc import load_function
 from miles.utils.types import ParamInfo
 
-from .common import get_atomic_update_groups, get_named_update_units, is_routed_expert_param, named_params_and_buffers
+from .common import get_atomic_update_groups, get_named_update_units, named_params_and_buffers
 
 MODELEXPRESS_LOGICAL_GROUP = "model"
 
@@ -1061,10 +1061,8 @@ class UpdateWeightFromModelExpress:
             (name.replace(".to_wrap.", "."), tensor)
             for name, tensor in named_params_and_buffers(self.args, self.model)
         ]
-        if self.model_kind == "moe" and int(self.source_geometry["ep_rank"]) != 0:
-            # Attention, shared experts, routers, embeddings, and norms are
-            # replicated over EP. Only one EP rank may publish those aliases.
-            named_tensors = [(name, tensor) for name, tensor in named_tensors if is_routed_expert_param(name)]
+        # EP replicas remain advertised so MX can select an owner already serving
+        # this receiver's experts. The receiver deduplicates each exact shard.
         missing = [name for name, _tensor in named_tensors if name not in self._param_info_by_name]
         if missing:
             raise RuntimeError(f"ModelExpress is missing ParamInfo metadata for trainer tensors: {missing}")

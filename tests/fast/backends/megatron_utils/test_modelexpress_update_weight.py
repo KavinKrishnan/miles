@@ -568,7 +568,7 @@ def test_qwen3moe_expert_data_parallel_fails_closed(runtime, monkeypatch):
         )
 
 
-def test_qwen3moe_nonowner_ep_rank_publishes_only_routed_experts(runtime, monkeypatch):
+def test_qwen3moe_ep_rank_advertises_experts_and_shared_replicas(runtime, monkeypatch):
     geometry = {
         "global_rank": 1,
         "tp_rank": 0,
@@ -614,8 +614,8 @@ def test_qwen3moe_nonowner_ep_rank_publishes_only_routed_experts(runtime, monkey
 
     tensors, units = updater._published_tensors_and_units()
 
-    assert [spec.native_name for spec in tensors] == [expert_name]
-    assert units == ((expert_name,),)
+    assert [spec.native_name for spec in tensors] == [expert_name, router_name]
+    assert units == ((expert_name,), (router_name,))
 
 
 def test_qwen3moe_ep_rank_publishes_when_ordinary_dp_rank_is_nonzero(runtime, monkeypatch):
