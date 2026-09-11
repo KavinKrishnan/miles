@@ -26,6 +26,7 @@ from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.ray_utils import Box
+from miles.utils.refit_timing import trace_refit
 from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from miles.utils.replay_base import all_replay_managers, routing_replay_manager
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
@@ -706,6 +707,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @timer
+    @trace_refit("trainer_actor_update")
     def update_weights(self, info: "EnginesAndLock") -> None:
         self._heartbeat.bump()
         if self.args.debug_train_only or self.args.debug_rollout_only:

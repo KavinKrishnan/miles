@@ -98,3 +98,12 @@ migration; record correctness and performance for the exact source revisions use
 ## Related
 
 - [P2P Weight Transfer](/docs/advanced/p2p-weight-transfer) -- push-mode RDMA alternative
+
+### Benchmark timing
+
+Set MILES_REFIT_TIMING=1 in trainer worker environments to emit
+MILES_REFIT_TIMING records. Each actor update records nested preparation,
+publication, trainer collective, receiver wait, and fleet activation intervals,
+correlated with the exact MX version and training step. Relative monotonic
+timestamps support local interval unions; wall-clock anchors alone do not prove
+cross-host clock alignment. Normal execution leaves this tracing disabled.

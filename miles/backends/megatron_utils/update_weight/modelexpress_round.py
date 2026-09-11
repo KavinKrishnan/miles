@@ -16,6 +16,7 @@ from miles.backends.megatron_utils.update_weight.common import (
 )
 from miles.backends.megatron_utils.update_weight.modelexpress import ModelExpressPublishRequest
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.refit_timing import refit_span, set_refit_identity, trace_refit
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,13 @@ logger = logging.getLogger(__name__)
 def _all_ranks(label, operation):
     value, error = None, None
     try:
-        value = operation()
+        with refit_span(label + ".operation"):
+            value = operation()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     statuses = [None] * dist.get_world_size()
-    dist.all_gather_object(statuses, (value, error), group=get_gloo_group())
+    with refit_span(label + ".trainer_collective"):
+        dist.all_gather_object(statuses, (value, error), group=get_gloo_group())
     failures = [(rank, item[1]) for rank, item in enumerate(statuses) if item[1]]
     if failures:
         raise RuntimeError(f"ModelExpress {label} failed closed on trainer ranks: {failures}")
@@ -46,10 +49,13 @@ def _prepare(update):
 
 def _pause(update):
     mode = update.args.pause_generation_mode
-    ray.get([engine.pause_generation.remote(mode=mode) for engine in update.rollout_engines])
+    with refit_span("pause_generation"):
+        ray.get([engine.pause_generation.remote(mode=mode) for engine in update.rollout_engines])
     if mode != "in_place":
-        ray.get([engine.flush_cache.remote() for engine in update.rollout_engines])
-    begin_weight_update(update.rollout_engines, weight_update_selector(update.args))
+        with refit_span("cache_flush"):
+            ray.get([engine.flush_cache.remote() for engine in update.rollout_engines])
+    with refit_span("begin_weight_update"):
+        begin_weight_update(update.rollout_engines, weight_update_selector(update.args))
 
 
 def _receive(update, version_id):
@@ -61,7 +67,8 @@ def _receive(update, version_id):
         )
         for engine in update.rollout_engines
     ]
-    results = ray.get(refs, timeout=timeout + 30)
+    with refit_span("receiver_rpc_wait"):
+        results = ray.get(refs, timeout=timeout + 30)
     _check_weight_sync_results(results, is_lora=False)
     for result, selected in zip(results, update.rollout_workers, strict=True):
         workers = result.get("workers", [])
@@ -82,7 +89,8 @@ def _receive(update, version_id):
 
 
 def _activate(update):
-    end_weight_update(update.rollout_engines)
+    with refit_span("end_weight_update"):
+        end_weight_update(update.rollout_engines)
     ray.get(
         [
             engine.update_weight_version.remote(weight_version=str(update.weight_version))
@@ -90,7 +98,8 @@ def _activate(update):
         ]
     )
     try:
-        ray.get([engine.continue_generation.remote() for engine in update.rollout_engines])
+        with refit_span("continue_generation"):
+            ray.get([engine.continue_generation.remote() for engine in update.rollout_engines])
     except Exception:
         # A resume RPC may have succeeded on a subset before another failed.
         ray.get(
@@ -102,7 +111,9 @@ def _activate(update):
         raise
 
 
+@trace_refit("refit_round")
 def run_update(update):
+    set_refit_identity(rank=dist.get_rank(), target_training_step=update.weight_version + 1)
     if update.rollout_engines is None:
         raise RuntimeError("ModelExpress rollout engines are not connected")
     if getattr(update, "_refit_failed", False):
@@ -127,6 +138,7 @@ def run_update(update):
             update_id=uuid.uuid4().hex,
         ),
     )
+    set_refit_identity(version_id=version_id, target_training_step=update.weight_version)
     primary_error = None
     try:
         _root("pause", lambda: _pause(update))
